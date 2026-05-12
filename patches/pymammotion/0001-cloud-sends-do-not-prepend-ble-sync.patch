@@ -1,0 +1,16 @@
+diff --git a/pymammotion/device/handle.py b/pymammotion/device/handle.py
+index 0000000..0000000 100644
+--- a/pymammotion/device/handle.py
++++ b/pymammotion/device/handle.py
+@@ -358,6 +358,9 @@ class DeviceHandle:
+         last = transport.last_send_monotonic
+-        # this will always be BLE as ble constantly pings 20s ble sync messages
+-        if last != 0.0 and time.monotonic() - last > 50:
++        if (
++            transport.transport_type is TransportType.BLE
++            and last != 0.0
++            and time.monotonic() - last > 50
++        ):
+             # No commands sent for 50 seconds — prepend a BLE sync so the
+             # device knows we are still connected before the real payload.
+             sync = self.commands.send_todev_ble_sync(sync_type=3)

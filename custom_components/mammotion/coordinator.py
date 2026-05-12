@@ -68,6 +68,7 @@ from pymammotion.transport.base import (
     ReLoginRequiredError,
     SessionExpiredError,
     Subscription,
+    TransportRateLimitedError,
     TransportType,
 )
 from pymammotion.transport.ble import BLETransport
@@ -97,6 +98,13 @@ REPORT_INTERVAL = timedelta(minutes=5)
 DEVICE_VERSION_INTERVAL = timedelta(weeks=1)
 MAP_INTERVAL = timedelta(minutes=60)
 RTK_INTERVAL = timedelta(hours=5)
+CLOUD_REPORT_ACTIVE_INTERVAL = timedelta(seconds=30)
+CLOUD_REPORT_IDLE_INTERVAL = timedelta(minutes=15)
+CLOUD_REPORT_DOCKED_INTERVAL = timedelta(minutes=60)
+CLOUD_REPORT_TRANSITION_INTERVAL = timedelta(seconds=15)
+CLOUD_REPORT_SEND_RESERVE = 40
+CLOUD_REPORT_CRITICAL_SEND_RESERVE = 10
+CLOUD_REPORT_BUDGET_LOG_INTERVAL = 3600.0
 
 
 class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # type: ignore[misc]
@@ -385,7 +393,7 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
             device = self.manager.get_device_by_name(self.device_name)
             if device is not None:
                 self.device_offline(device)
-        except TooManyRequestsException as exc:
+        except (TooManyRequestsException, TransportRateLimitedError) as exc:
             raise HomeAssistantError(
                 translation_domain=DOMAIN, translation_key="api_limit_exceeded"
             ) from exc
@@ -446,7 +454,7 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
             return False
         except DeviceOfflineException:
             self.device_offline(device)
-        except TooManyRequestsException as exc:
+        except (TooManyRequestsException, TransportRateLimitedError) as exc:
             raise HomeAssistantError(
                 translation_domain=DOMAIN, translation_key="api_limit_exceeded"
             ) from exc
@@ -490,7 +498,7 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
             LOGGER.error(f"Device offline: {ex.iot_id}")
             self.device_offline(device)
             return False
-        except TooManyRequestsException as exc:
+        except (TooManyRequestsException, TransportRateLimitedError) as exc:
             raise HomeAssistantError(
                 translation_domain=DOMAIN, translation_key="api_limit_exceeded"
             ) from exc
@@ -1295,6 +1303,8 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
 
         self._on_stop: list[CALLBACK_TYPE] = []
         self.service_info: BluetoothServiceInfoBleak | None = None
+        self._last_cloud_snapshot_at = 0.0
+        self._last_cloud_budget_log_at = 0.0
 
         self.poll_debouncer = Debouncer(
             hass,
@@ -1379,6 +1389,175 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         """Get coordinator data."""
         return device
 
+    def _has_usable_ble_transport(self) -> bool:
+        """Return True when BLE can provide fresher local report data."""
+        if not self._bluetooth_enabled:
+            return False
+        handle = self.manager.mower(self.device_name)
+        if handle is None:
+            return False
+        ble = handle.get_transport(TransportType.BLE)
+        return ble is not None and ble.is_connected and ble.is_usable
+
+    def _cloud_send_budget(self) -> tuple[int | None, int, bool]:
+        """Return cloud send limit, current sends, and whether a cloud transport is limited."""
+        handle = self.manager.mower(self.device_name)
+        if handle is None:
+            return None, 0, False
+
+        limit: int | None = None
+        used = 0
+        rate_limited = False
+
+        for transport_type in (
+            TransportType.CLOUD_ALIYUN,
+            TransportType.CLOUD_MAMMOTION,
+        ):
+            transport = handle.get_transport(transport_type)
+            if transport is None:
+                continue
+
+            if hasattr(transport, "sends_in_window"):
+                used = max(used, int(transport.sends_in_window()))
+
+            transport_limit = getattr(transport, "_SEND_LIMIT", None)
+            if isinstance(transport_limit, int):
+                limit = transport_limit if limit is None else min(limit, transport_limit)
+
+            rate_limited = rate_limited or bool(
+                getattr(transport, "is_rate_limited", False)
+            )
+
+        return limit, used, rate_limited
+
+    def _cloud_report_interval(self) -> timedelta:
+        """Return a conservative cloud snapshot cadence for the current mower state."""
+        dev = self.data.report_data.dev
+        try:
+            sys_status = int(dev.sys_status)
+        except (TypeError, ValueError):
+            return CLOUD_REPORT_IDLE_INTERVAL
+
+        if sys_status in MOWING_ACTIVE_MODES:
+            return CLOUD_REPORT_ACTIVE_INTERVAL
+
+        try:
+            if int(dev.charge_state) != 0:
+                return CLOUD_REPORT_DOCKED_INTERVAL
+        except (TypeError, ValueError):
+            pass
+
+        if sys_status == int(WorkMode.MODE_READY):
+            try:
+                if int(dev.battery_val) >= 100:
+                    return CLOUD_REPORT_DOCKED_INTERVAL
+            except (TypeError, ValueError):
+                pass
+
+            try:
+                if int(dev.last_status) == int(WorkMode.MODE_RETURNING):
+                    return CLOUD_REPORT_DOCKED_INTERVAL
+            except (TypeError, ValueError):
+                pass
+
+        return CLOUD_REPORT_IDLE_INTERVAL
+
+    def _cloud_snapshot_budget_allows(self, *, priority: bool) -> bool:
+        """Return True when a cloud snapshot should be allowed by the send budget."""
+        if not self._cloud_enabled or not self.has_cloud_account:
+            return False
+
+        limit, used, rate_limited = self._cloud_send_budget()
+        if rate_limited:
+            self._log_cloud_budget_skip("transport is rate limited")
+            return False
+
+        if limit is None:
+            return True
+
+        reserve = (
+            CLOUD_REPORT_CRITICAL_SEND_RESERVE
+            if priority
+            else CLOUD_REPORT_SEND_RESERVE
+        )
+        remaining = limit - used
+        if remaining <= reserve:
+            self._log_cloud_budget_skip(
+                f"{remaining} sends remaining, reserve is {reserve}"
+            )
+            return False
+
+        return True
+
+    def _log_cloud_budget_skip(self, reason: str) -> None:
+        """Rate-limit repeated cloud-budget log noise."""
+        now = time.monotonic()
+        if now - self._last_cloud_budget_log_at < CLOUD_REPORT_BUDGET_LOG_INTERVAL:
+            return
+        self._last_cloud_budget_log_at = now
+        LOGGER.debug(
+            "report-coordinator [%s]: skipping cloud snapshot because %s",
+            self.device_name,
+            reason,
+        )
+
+    async def _async_request_report_snapshot_guarded(
+        self, *, priority: bool = False, reason: str
+    ) -> None:
+        """Request a report snapshot without burning cloud quota unnecessarily."""
+        if self._has_usable_ble_transport():
+            try:
+                await self.async_request_report_snapshot()
+            except (
+                DeviceOfflineException,
+                NoTransportAvailableError,
+                TransportRateLimitedError,
+                TooManyRequestsException,
+            ):
+                LOGGER.debug(
+                    "report-coordinator [%s]: BLE/local snapshot skipped for %s",
+                    self.device_name,
+                    reason,
+                    exc_info=True,
+                )
+            return
+
+        if not self.is_online() or not self._cloud_snapshot_budget_allows(
+            priority=priority
+        ):
+            return
+
+        now = time.monotonic()
+        interval = (
+            CLOUD_REPORT_TRANSITION_INTERVAL if priority else self._cloud_report_interval()
+        ).total_seconds()
+
+        if now - self._last_cloud_snapshot_at < interval:
+            return
+
+        handle = self.manager.mower(self.device_name)
+        last_report_at = getattr(handle, "last_report_at", 0.0) if handle else 0.0
+        if last_report_at and now - last_report_at < interval:
+            return
+
+        try:
+            await self.async_request_report_snapshot()
+        except (
+            DeviceOfflineException,
+            NoTransportAvailableError,
+            TransportRateLimitedError,
+            TooManyRequestsException,
+        ):
+            LOGGER.debug(
+                "report-coordinator [%s]: cloud snapshot skipped for %s",
+                self.device_name,
+                reason,
+                exc_info=True,
+            )
+            return
+
+        self._last_cloud_snapshot_at = now
+
     async def _async_update_data(self) -> MowingDevice:
         """Get data from the device."""
         if data := await super()._async_update_data():
@@ -1392,6 +1571,7 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         LOGGER.debug("Updated Mammotion device %s", self.device_name)
         self.update_failures = 0
         await self.async_save_data(device)
+        await self._async_request_report_snapshot_guarded(reason="periodic refresh")
 
         if self.data.mower_state.ble_mac != "" and len(self._on_stop) == 0:
             self._on_stop.append(
@@ -1427,23 +1607,23 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
     async def _async_update_properties(
         self, properties: ThingPropertiesMessage
     ) -> None:
-        """Update data from incoming properties messages."""
+        """Handle incoming properties messages."""
         if not self.data.enabled:
             return
         if not self.is_online():
             await self.set_scheduled_updates(True)
-        if device := self.manager.get_device_by_name(self.device_name):
-            self.async_set_updated_data(device)
+        # DeviceHandle applies properties and emits state_changed; avoid pushing
+        # the same device state a second time through this side-channel.
 
     async def _async_update_status(self, status: ThingStatusMessage) -> None:
-        """Update data from incoming status messages."""
+        """Handle incoming status messages."""
         if not self.data.enabled:
             return
         if status.params.status.value == StatusType.CONNECTED:
             await self.set_scheduled_updates(True)
             self.hass.async_create_task(self.async_request_refresh())
-        if device := self.manager.get_device_by_name(self.device_name):
-            self.async_set_updated_data(device)
+        # DeviceHandle emits state_changed for status storage as well; this
+        # callback only handles the reconnect side effects above.
 
     async def _async_update_event_message(self, event: ThingEventMessage) -> None:
         """Update data from incoming event messages."""
@@ -1456,7 +1636,9 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
 
     async def _async_setup(self) -> None:
         await super()._async_setup()
-        await self.async_request_report_snapshot()
+        await self._async_request_report_snapshot_guarded(
+            priority=True, reason="setup"
+        )
 
         try:
             await self.async_read_rain_detection()
@@ -1476,6 +1658,8 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
             CommandTimeoutError,
             ConcurrentRequestError,
             BLEUnavailableError,
+            TooManyRequestsException,
+            TransportRateLimitedError,
         ):
             pass
 
@@ -1491,13 +1675,9 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
 
     async def _on_sys_status_changed_refresh(self, sys_status: int) -> None:
         """Trigger a one-shot count=1 poll on sys_status transitions when not streaming."""
-        try:
-            await self.async_request_report_snapshot()
-        except (DeviceOfflineException, NoTransportAvailableError):
-            LOGGER.debug(
-                "report-coordinator [%s]: skipping sys_status refresh — device offline / no transport",
-                self.device_name,
-            )
+        await self._async_request_report_snapshot_guarded(
+            priority=True, reason="sys_status transition"
+        )
 
 
 class MammotionMaintenanceUpdateCoordinator(MammotionBaseUpdateCoordinator[Maintain]):
