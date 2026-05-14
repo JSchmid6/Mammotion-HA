@@ -31,6 +31,26 @@ official Mammotion app opens and causes additional report traffic.
 The HA runtime patch adds the missing properties topic whenever Mammotion MQTT
 registers a device.
 
+## MQTT auth and rate-limit recovery
+
+Target: `pymammotion` 0.7.109 and 0.7.110.
+
+Upstream `pymammotion` has unreleased fixes for several failure storms around
+Mammotion MQTT:
+
+- direct `MQTTTransport.send()` calls should stop immediately when the transport
+  has self-imposed its 24-hour send limit;
+- the send-limit warning should only be logged when the limit is first crossed;
+- repeated `force_refresh_invoke_token()` failures should cool down instead of
+  retrying on every queued command;
+- MQTT credential refresh returning `None` should surface as a re-login error
+  instead of an `AttributeError`;
+- a fatal MQTT auth failure should mark the transport unusable until the
+  integration's re-login callback succeeds.
+
+The HA runtime patch mirrors those guards defensively and skips them when a
+future upstream version already contains the same behavior.
+
 For a clean dependency-level install, apply the patch to a public fork or local
 wheel and point `custom_components/mammotion/manifest.json` at that build.
 Home Assistant supports pip-compatible requirement strings, including public
