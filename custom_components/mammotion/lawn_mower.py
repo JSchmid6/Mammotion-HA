@@ -344,36 +344,25 @@ class MammotionLawnMowerEntity(MammotionBaseEntity, LawnMowerEntity):  # type: i
         trans_key = "pause_failed"
 
         await self.coordinator.async_start_report_stream()
-        charge_state = self.rpt_dev_status.charge_state
         mode = self.rpt_dev_status.sys_status
         if mode is None:
             raise HomeAssistantError(
                 translation_domain=DOMAIN, translation_key="device_not_ready"
             )
 
-        if charge_state == 0 and mode in (
-            WorkMode.MODE_WORKING,
-            WorkMode.MODE_PAUSE,
-            WorkMode.MODE_READY,
-            WorkMode.MODE_RETURNING,
-        ):
-            try:
-                if mode == WorkMode.MODE_WORKING:
-                    trans_key = "pause_failed"
-                    await self.coordinator.async_send_command("pause_execute_task")
+        try:
+            if mode == WorkMode.MODE_WORKING:
+                trans_key = "pause_failed"
+                await self.coordinator.async_send_command("pause_execute_task")
 
-                if mode == WorkMode.MODE_RETURNING:
-                    trans_key = "dock_cancel_failed"
-                    await self.coordinator.async_send_command("cancel_return_to_dock")
-                else:
-                    trans_key = "dock_failed"
-                    await self.coordinator.async_send_command("return_to_dock")
-            except COMMAND_EXCEPTIONS as exc:
-                raise HomeAssistantError(
-                    translation_domain=DOMAIN, translation_key=trans_key
-                ) from exc
-            finally:
-                await self.coordinator.async_request_report_snapshot()
+            trans_key = "dock_failed"
+            await self.coordinator.async_send_command("return_to_dock")
+        except COMMAND_EXCEPTIONS as exc:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN, translation_key=trans_key
+            ) from exc
+        finally:
+            await self.coordinator.async_request_report_snapshot()
 
     async def async_pause(self) -> None:
         """Pause mower."""
