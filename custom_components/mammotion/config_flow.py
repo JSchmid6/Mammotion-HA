@@ -369,7 +369,10 @@ class MammotionConfigFlowHandler(OptionsFlow):
         """Initialize options flow."""
         self._config_entry = config_entry
         self.prefer_ble = config_entry.options.get(CONF_PREFER_BLE, True)
-        self.movement_use_wifi = config_entry.options.get(CONF_MOVEMENT_USE_WIFI, False)
+        no_ble_devices = not bool(config_entry.data.get(CONF_BLE_DEVICES))
+        self.movement_use_wifi = config_entry.options.get(
+            CONF_MOVEMENT_USE_WIFI, no_ble_devices
+        )
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None

@@ -16,7 +16,7 @@ from pymammotion.transport.base import TransportType
 from pymammotion.utility.device_type import DeviceType
 
 from . import MammotionConfigEntry
-from .const import CONF_MOVEMENT_USE_WIFI, DOMAIN
+from .const import CONF_BLE_DEVICES, CONF_MOVEMENT_USE_WIFI, DOMAIN
 from .coordinator import (
     MammotionBaseUpdateCoordinator,
     MammotionReportUpdateCoordinator,
@@ -42,13 +42,19 @@ class MammotionTaskButtonSensorEntityDescription(ButtonEntityDescription):
 
 def _nudge_available(coordinator: MammotionBaseUpdateCoordinator) -> bool:
     """Return True when movement via BLE or Wi-Fi is possible."""
-    if coordinator.config_entry.options.get(CONF_MOVEMENT_USE_WIFI, False):
+    if _nudge_uses_wifi(coordinator):
         return True
     handle = coordinator.manager.mower(coordinator.device_name)
     if handle is None:
         return False
     ble = handle.get_transport(TransportType.BLE)
     return ble is not None and ble.is_usable
+
+
+def _nudge_uses_wifi(coordinator: MammotionBaseUpdateCoordinator) -> bool:
+    """Return True when movement nudges should use cloud/Wi-Fi."""
+    default = not bool(coordinator.config_entry.data.get(CONF_BLE_DEVICES))
+    return coordinator.config_entry.options.get(CONF_MOVEMENT_USE_WIFI, default)
 
 
 BUTTON_SENSORS: tuple[MammotionButtonSensorEntityDescription, ...] = (
@@ -75,7 +81,7 @@ BUTTON_SENSORS: tuple[MammotionButtonSensorEntityDescription, ...] = (
         key="emergency_nudge_forward",
         press_fn=lambda coordinator: coordinator.async_move_forward(
             0.4,
-            coordinator.config_entry.options.get(CONF_MOVEMENT_USE_WIFI, False),
+            _nudge_uses_wifi(coordinator),
         ),
         available_fn=_nudge_available,
     ),
@@ -83,7 +89,7 @@ BUTTON_SENSORS: tuple[MammotionButtonSensorEntityDescription, ...] = (
         key="emergency_nudge_left",
         press_fn=lambda coordinator: coordinator.async_move_left(
             0.4,
-            coordinator.config_entry.options.get(CONF_MOVEMENT_USE_WIFI, False),
+            _nudge_uses_wifi(coordinator),
         ),
         available_fn=_nudge_available,
     ),
@@ -91,7 +97,7 @@ BUTTON_SENSORS: tuple[MammotionButtonSensorEntityDescription, ...] = (
         key="emergency_nudge_right",
         press_fn=lambda coordinator: coordinator.async_move_right(
             0.4,
-            coordinator.config_entry.options.get(CONF_MOVEMENT_USE_WIFI, False),
+            _nudge_uses_wifi(coordinator),
         ),
         available_fn=_nudge_available,
     ),
@@ -99,7 +105,7 @@ BUTTON_SENSORS: tuple[MammotionButtonSensorEntityDescription, ...] = (
         key="emergency_nudge_back",
         press_fn=lambda coordinator: coordinator.async_move_back(
             0.4,
-            coordinator.config_entry.options.get(CONF_MOVEMENT_USE_WIFI, False),
+            _nudge_uses_wifi(coordinator),
         ),
         available_fn=_nudge_available,
     ),

@@ -71,6 +71,7 @@ from .coordinator import (
     MammotionRTKCoordinator,
 )
 from .models import MammotionDevices, MammotionMowerData, MammotionRTKData
+from .pymammotion_patches import apply_pymammotion_patches
 from .services import async_setup_services
 
 PLATFORMS: list[Platform] = [
@@ -264,6 +265,8 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
 
 async def async_setup_entry(hass: HomeAssistant, entry: MammotionConfigEntry) -> bool:
     """Set up Mammotion from a config entry."""
+
+    apply_pymammotion_patches()
 
     addresses = entry.data.get(CONF_BLE_DEVICES, {})
     integration = await async_get_integration(hass, DOMAIN)
