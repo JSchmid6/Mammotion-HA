@@ -105,6 +105,7 @@ CLOUD_REPORT_TRANSITION_INTERVAL = timedelta(seconds=15)
 CLOUD_REPORT_SEND_RESERVE = 40
 CLOUD_REPORT_CRITICAL_SEND_RESERVE = 10
 CLOUD_REPORT_BUDGET_LOG_INTERVAL = 3600.0
+COMMAND_WARNING_LOG_INTERVAL = 900.0
 
 
 class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # type: ignore[misc]
@@ -138,6 +139,7 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
         self.manager: MammotionClient = mammotion
         self._operation_settings = OperationSettings()
         self.update_failures = 0
+        self._last_command_warning_log_at: dict[str, float] = {}
         self._stream_data: Response[StreamSubscriptionResponse] | None = (
             None  # Stream data [Agora]
         )
@@ -290,6 +292,17 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
                 return True
         return bool(not handle.availability.mqtt_reported_offline)
 
+    def _log_command_warning(self, key: str, message: str, *args: Any) -> None:
+        """Log recurring command transport warnings without flooding the log."""
+        now = time.monotonic()
+        if (
+            now - self._last_command_warning_log_at.get(key, 0.0)
+            < COMMAND_WARNING_LOG_INTERVAL
+        ):
+            return
+        self._last_command_warning_log_at[key] = now
+        LOGGER.warning(message, *args)
+
     @property
     def bluetooth_enabled(self) -> bool:
         """Return whether Bluetooth transport is enabled."""
@@ -393,20 +406,58 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
             device = self.manager.get_device_by_name(self.device_name)
             if device is not None:
                 self.device_offline(device)
+            self._log_command_warning(
+                "offline",
+                "Mammotion command '%s' for %s skipped because the mower is offline",
+                command,
+                self.device_name,
+            )
         except (TooManyRequestsException, TransportRateLimitedError) as exc:
+            self._log_command_warning(
+                "rate-limit",
+                "Mammotion command '%s' for %s blocked by rate limiting: %s",
+                command,
+                self.device_name,
+                exc,
+            )
             raise HomeAssistantError(
                 translation_domain=DOMAIN, translation_key="api_limit_exceeded"
             ) from exc
         except NoTransportAvailableError as exc:
+            self._log_command_warning(
+                "no-transport",
+                "Mammotion command '%s' for %s failed because no transport "
+                "is connected",
+                command,
+                self.device_name,
+            )
             raise HomeAssistantError(
                 translation_domain=DOMAIN, translation_key="command_failed"
             ) from exc
-        except (
-            GatewayTimeoutException,
-            CommandTimeoutError,
-            ConcurrentRequestError,
-        ):
-            pass
+        except GatewayTimeoutException as exc:
+            self._log_command_warning(
+                "gateway-timeout",
+                "Mammotion command '%s' for %s timed out at the cloud gateway: %s",
+                command,
+                self.device_name,
+                exc,
+            )
+        except CommandTimeoutError as exc:
+            self._log_command_warning(
+                "command-timeout",
+                "Mammotion command '%s' for %s timed out waiting for device "
+                "response: %s",
+                command,
+                self.device_name,
+                exc,
+            )
+        except ConcurrentRequestError:
+            LOGGER.debug(
+                "Mammotion command '%s' for %s skipped because another "
+                "request is active",
+                command,
+                self.device_name,
+            )
 
     @staticmethod
     def device_offline(device: MowingDevice | RTKBaseStationDevice) -> None:
@@ -443,31 +494,59 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
             )
             self.update_failures = 0
             return True
-        except FailedRequestException:
+        except FailedRequestException as exc:
+            self._log_command_warning(
+                "failed-request",
+                "Mammotion command '%s' for %s failed: %s",
+                command,
+                self.device_name,
+                exc,
+            )
             self.update_failures += 1
         except EXPIRED_CREDENTIAL_EXCEPTIONS as exc:
             self.update_failures += 1
             await self.async_refresh_login(exc)
         except GatewayTimeoutException as ex:
-            LOGGER.error(f"Gateway timeout exception: {ex.iot_id}")
+            self._log_command_warning(
+                "gateway-timeout",
+                "Mammotion command '%s' for %s timed out at the cloud gateway "
+                "(iot_id=%s)",
+                command,
+                self.device_name,
+                getattr(ex, "iot_id", self.device.iot_id),
+            )
             self.update_failures = 0
             return False
         except DeviceOfflineException:
+            self._log_command_warning(
+                "offline",
+                "Mammotion command '%s' for %s skipped because the mower is offline",
+                command,
+                self.device_name,
+            )
             self.device_offline(device)
         except (TooManyRequestsException, TransportRateLimitedError) as exc:
+            self._log_command_warning(
+                "rate-limit",
+                "Mammotion command '%s' for %s blocked by rate limiting: %s",
+                command,
+                self.device_name,
+                exc,
+            )
             raise HomeAssistantError(
                 translation_domain=DOMAIN, translation_key="api_limit_exceeded"
             ) from exc
         except NoTransportAvailableError as exc:
-            LOGGER.debug(
-                "No transport connected yet for %s, command '%s' skipped",
-                self.device_name,
+            self._log_command_warning(
+                "no-transport",
+                "Mammotion command '%s' for %s failed because no transport "
+                "is connected",
                 command,
+                self.device_name,
             )
             raise HomeAssistantError(
                 translation_domain=DOMAIN, translation_key="command_failed"
             ) from exc
-            return False
         return False
 
     async def async_send_cloud_command(
@@ -485,20 +564,44 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
             await handle.send_raw(command)
             self.update_failures = 0
             return True
-        except FailedRequestException:
+        except FailedRequestException as exc:
+            self._log_command_warning(
+                "failed-request",
+                "Mammotion cloud command for %s failed: %s",
+                self.device_name,
+                exc,
+            )
             self.update_failures += 1
         except EXPIRED_CREDENTIAL_EXCEPTIONS as exc:
             self.update_failures += 1
             await self.async_refresh_login(exc)
         except GatewayTimeoutException as ex:
-            LOGGER.error(f"Gateway timeout exception: {ex.iot_id}")
+            self._log_command_warning(
+                "gateway-timeout",
+                "Mammotion cloud command for %s timed out at the gateway "
+                "(iot_id=%s)",
+                self.device_name,
+                getattr(ex, "iot_id", iot_id),
+            )
             self.update_failures = 0
             return False
         except (DeviceOfflineException, NoTransportAvailableError) as ex:
-            LOGGER.error(f"Device offline: {ex.iot_id}")
+            self._log_command_warning(
+                "offline-or-unreachable",
+                "Mammotion cloud command for %s skipped because the device is "
+                "offline or unreachable (iot_id=%s)",
+                self.device_name,
+                getattr(ex, "iot_id", iot_id),
+            )
             self.device_offline(device)
             return False
         except (TooManyRequestsException, TransportRateLimitedError) as exc:
+            self._log_command_warning(
+                "rate-limit",
+                "Mammotion cloud command for %s blocked by rate limiting: %s",
+                self.device_name,
+                exc,
+            )
             raise HomeAssistantError(
                 translation_domain=DOMAIN, translation_key="api_limit_exceeded"
             ) from exc
@@ -1305,6 +1408,7 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         self.service_info: BluetoothServiceInfoBleak | None = None
         self._last_cloud_snapshot_at = 0.0
         self._last_cloud_budget_log_at = 0.0
+        self._last_cloud_snapshot_failure_log_at = 0.0
 
         self.poll_debouncer = Debouncer(
             hass,
@@ -1495,10 +1599,29 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         if now - self._last_cloud_budget_log_at < CLOUD_REPORT_BUDGET_LOG_INTERVAL:
             return
         self._last_cloud_budget_log_at = now
-        LOGGER.debug(
-            "report-coordinator [%s]: skipping cloud snapshot because %s",
+        LOGGER.warning(
+            "report-coordinator [%s]: skipping cloud snapshot because %s; "
+            "mower status may be stale until Mammotion MQTT publishes new data",
             self.device_name,
             reason,
+        )
+
+    def _log_cloud_snapshot_failure(self, reason: str, exc: Exception) -> None:
+        """Rate-limit cloud snapshot failure warnings."""
+        now = time.monotonic()
+        if (
+            now - self._last_cloud_snapshot_failure_log_at
+            < CLOUD_REPORT_BUDGET_LOG_INTERVAL
+        ):
+            return
+        self._last_cloud_snapshot_failure_log_at = now
+        LOGGER.warning(
+            "report-coordinator [%s]: cloud snapshot for %s failed with %s: %s; "
+            "mower status may be stale until Mammotion MQTT publishes new data",
+            self.device_name,
+            reason,
+            type(exc).__name__,
+            exc,
         )
 
     async def _async_request_report_snapshot_guarded(
@@ -1513,13 +1636,18 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
                 NoTransportAvailableError,
                 TransportRateLimitedError,
                 TooManyRequestsException,
-            ):
-                LOGGER.debug(
-                    "report-coordinator [%s]: BLE/local snapshot skipped for %s",
-                    self.device_name,
-                    reason,
-                    exc_info=True,
-                )
+            ) as exc:
+                if isinstance(
+                    exc, (TransportRateLimitedError, TooManyRequestsException)
+                ):
+                    self._log_cloud_snapshot_failure(reason, exc)
+                else:
+                    LOGGER.debug(
+                        "report-coordinator [%s]: BLE/local snapshot skipped for %s",
+                        self.device_name,
+                        reason,
+                        exc_info=True,
+                    )
             return
 
         if not self.is_online() or not self._cloud_snapshot_budget_allows(
@@ -1547,13 +1675,8 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
             NoTransportAvailableError,
             TransportRateLimitedError,
             TooManyRequestsException,
-        ):
-            LOGGER.debug(
-                "report-coordinator [%s]: cloud snapshot skipped for %s",
-                self.device_name,
-                reason,
-                exc_info=True,
-            )
+        ) as exc:
+            self._log_cloud_snapshot_failure(reason, exc)
             return
 
         self._last_cloud_snapshot_at = now
