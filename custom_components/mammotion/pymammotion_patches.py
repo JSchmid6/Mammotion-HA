@@ -25,12 +25,33 @@ _MQTT_SEND_PATCH_ATTR = "_mammotion_ha_mqtt_send_patch"
 _INVOKE_REFRESH_PATCH_ATTR = "_mammotion_ha_invoke_refresh_patch"
 _MQTT_CREDS_PATCH_ATTR = "_mammotion_ha_mqtt_creds_patch"
 _INVOKE_REFRESH_COOLDOWN = 30.0
+_PATCH_WARNING_LOG_INTERVAL = 900.0
 _LOGGER = logging.getLogger(__name__)
+_last_patch_warning_log_at: dict[str, float] = {}
 
 _original_register_device = MQTTTransport.register_device
 _original_mqtt_send = MQTTTransport.send
 _original_force_refresh_invoke_token = TokenManager.force_refresh_invoke_token
 _original_refresh_mqtt_creds = TokenManager.refresh_mqtt_creds
+
+
+def _patch_warning_allowed(key: str) -> bool:
+    """Return True when a patch warning should be emitted."""
+    now = time.monotonic()
+    if (
+        now - _last_patch_warning_log_at.get(key, 0.0)
+        < _PATCH_WARNING_LOG_INTERVAL
+    ):
+        return False
+    _last_patch_warning_log_at[key] = now
+    return True
+
+
+def _log_patch_warning(key: str, message: str, *args: object) -> None:
+    """Log recurring runtime patch warnings without flooding the log."""
+    if not _patch_warning_allowed(key):
+        return
+    _LOGGER.warning(message, *args)
 
 
 def _send_marked_already_cloud_safe() -> bool:
@@ -196,6 +217,12 @@ async def _mqtt_send_with_rate_and_auth_guard(
     try:
         await _original_mqtt_send(self, payload, iot_id)
     except ReLoginRequiredError as exc:
+        _log_patch_warning(
+            "mqtt-auth-failed",
+            "MQTT transport authentication failed; marking transport unusable "
+            "until credentials are refreshed: %s",
+            exc,
+        )
         _mark_transport_auth_failed(self)
         await _fire_fatal_auth(self, exc)
         raise
@@ -209,6 +236,8 @@ async def _fire_fatal_auth(transport: MQTTTransport, exc: Exception) -> None:
     try:
         await callback(exc)
     except Exception:  # noqa: BLE001
+        if _patch_warning_allowed("fatal-auth-callback"):
+            _LOGGER.exception("Fatal MQTT auth recovery callback failed")
         return
     _clear_transport_auth_failed(transport)
 
@@ -235,8 +264,14 @@ async def _force_refresh_invoke_token_with_cooldown(self: TokenManager) -> None:
             )
     try:
         await _original_force_refresh_invoke_token(self)
-    except (AuthError, ReLoginRequiredError):
+    except (AuthError, ReLoginRequiredError) as exc:
         setattr(self, "_invoke_refresh_failed_at", time.monotonic())
+        _log_patch_warning(
+            "invoke-token-refresh",
+            "Mammotion invoke-token refresh failed; backing off for %.0fs: %s",
+            _INVOKE_REFRESH_COOLDOWN,
+            exc,
+        )
         raise
     setattr(self, "_invoke_refresh_failed_at", None)
 
@@ -254,6 +289,10 @@ async def _refresh_mqtt_creds_require_result(self: TokenManager) -> MQTTCredenti
     """Raise a re-login error instead of returning None MQTT credentials."""
     creds = await _original_refresh_mqtt_creds(self)
     if creds is None:
+        _log_patch_warning(
+            "mqtt-creds-none",
+            "Mammotion MQTT credential refresh returned no credentials",
+        )
         raise ReLoginRequiredError(
             _token_manager_account_id(self),
             "MQTT credentials not set after refresh",
