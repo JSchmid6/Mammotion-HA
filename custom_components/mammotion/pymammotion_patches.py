@@ -19,6 +19,7 @@ from pymammotion.transport.mqtt import MQTTTransport
 
 _SEND_MARKED_PATCH_ATTR = "_mammotion_ha_cloud_safe_send_marked"
 _MQTT_REALTIME_TOPICS_PATCH_ATTR = "_mammotion_ha_mqtt_realtime_topics_patch"
+_MQTT_PROTO_DISPATCH_PATCH_ATTR = "_mammotion_ha_mqtt_proto_dispatch_patch"
 _TRANSPORT_AUTH_PATCH_ATTR = "_mammotion_ha_transport_auth_state_patch"
 _RECORD_SEND_PATCH_ATTR = "_mammotion_ha_record_send_patch"
 _MQTT_SEND_PATCH_ATTR = "_mammotion_ha_mqtt_send_patch"
@@ -30,6 +31,7 @@ _LOGGER = logging.getLogger(__name__)
 _last_patch_warning_log_at: dict[str, float] = {}
 
 _original_register_device = MQTTTransport.register_device
+_original_mqtt_dispatch = MQTTTransport._dispatch  # noqa: SLF001
 _original_mqtt_send = MQTTTransport.send
 _original_force_refresh_invoke_token = TokenManager.force_refresh_invoke_token
 _original_refresh_mqtt_creds = TokenManager.refresh_mqtt_creds
@@ -92,6 +94,12 @@ def apply_pymammotion_patches() -> None:
         setattr(MQTTTransport, "register_device", _register_device_with_realtime_topics)
         setattr(MQTTTransport, _MQTT_REALTIME_TOPICS_PATCH_ATTR, True)
 
+    if not _mqtt_dispatch_proto_aware() and not getattr(
+        MQTTTransport, _MQTT_PROTO_DISPATCH_PATCH_ATTR, False
+    ):
+        setattr(MQTTTransport, "_dispatch", _mqtt_dispatch_with_proto_routing)
+        setattr(MQTTTransport, _MQTT_PROTO_DISPATCH_PATCH_ATTR, True)
+
     if not _transport_auth_state_already_present() and not getattr(
         Transport, _TRANSPORT_AUTH_PATCH_ATTR, False
     ):
@@ -147,6 +155,42 @@ def _register_device_with_realtime_topics(
         f"{base_topic}/thing/event/property/post",
     ):
         self.add_topic(topic)
+
+
+def _mqtt_dispatch_proto_aware() -> bool:
+    """Return True when upstream parses /sys/proto/<pk>/<dn> topics correctly."""
+    try:
+        source = inspect.getsource(MQTTTransport._dispatch)  # noqa: SLF001
+    except (OSError, TypeError):
+        return False
+    return "is_proto_topic" in source or 'parts[2] == "proto"' in source
+
+
+async def _mqtt_dispatch_with_proto_routing(
+    self: MQTTTransport, topic: str, raw: bytes
+) -> None:
+    """Route Mammotion direct MQTT proto topics with the correct pk/dn offset."""
+    if not topic.startswith("/sys/proto/") or self.on_device_message is None:
+        await _original_mqtt_dispatch(self, topic, raw)
+        return
+
+    parts = topic.split("/")
+    if len(parts) < 5:
+        await _original_mqtt_dispatch(self, topic, raw)
+        return
+
+    product_key = parts[3]
+    device_name = parts[4]
+    iot_id = self._device_to_iot.get((product_key, device_name))
+    if not iot_id:
+        _LOGGER.debug("MQTTTransport: could not route proto message on topic %s", topic)
+        return
+
+    decoded = self._unwrap_envelope(topic, raw)
+    if decoded is None:
+        return
+
+    await self.on_device_message(iot_id, decoded)
 
 
 def _transport_auth_state_already_present() -> bool:
