@@ -18,7 +18,7 @@ from pymammotion.transport.base import (
 from pymammotion.transport.mqtt import MQTTTransport
 
 _SEND_MARKED_PATCH_ATTR = "_mammotion_ha_cloud_safe_send_marked"
-_PROPERTIES_TOPIC_PATCH_ATTR = "_mammotion_ha_properties_topic_patch"
+_MQTT_REALTIME_TOPICS_PATCH_ATTR = "_mammotion_ha_mqtt_realtime_topics_patch"
 _TRANSPORT_AUTH_PATCH_ATTR = "_mammotion_ha_transport_auth_state_patch"
 _RECORD_SEND_PATCH_ATTR = "_mammotion_ha_record_send_patch"
 _MQTT_SEND_PATCH_ATTR = "_mammotion_ha_mqtt_send_patch"
@@ -38,10 +38,7 @@ _original_refresh_mqtt_creds = TokenManager.refresh_mqtt_creds
 def _patch_warning_allowed(key: str) -> bool:
     """Return True when a patch warning should be emitted."""
     now = time.monotonic()
-    if (
-        now - _last_patch_warning_log_at.get(key, 0.0)
-        < _PATCH_WARNING_LOG_INTERVAL
-    ):
+    if now - _last_patch_warning_log_at.get(key, 0.0) < _PATCH_WARNING_LOG_INTERVAL:
         return False
     _last_patch_warning_log_at[key] = now
     return True
@@ -91,9 +88,9 @@ def apply_pymammotion_patches() -> None:
             setattr(DeviceHandle, "_send_marked", _send_marked_cloud_safe)
         setattr(DeviceHandle, _SEND_MARKED_PATCH_ATTR, True)
 
-    if not getattr(MQTTTransport, _PROPERTIES_TOPIC_PATCH_ATTR, False):
-        setattr(MQTTTransport, "register_device", _register_device_with_properties)
-        setattr(MQTTTransport, _PROPERTIES_TOPIC_PATCH_ATTR, True)
+    if not getattr(MQTTTransport, _MQTT_REALTIME_TOPICS_PATCH_ATTR, False):
+        setattr(MQTTTransport, "register_device", _register_device_with_realtime_topics)
+        setattr(MQTTTransport, _MQTT_REALTIME_TOPICS_PATCH_ATTR, True)
 
     if not _transport_auth_state_already_present() and not getattr(
         Transport, _TRANSPORT_AUTH_PATCH_ATTR, False
@@ -132,12 +129,24 @@ def apply_pymammotion_patches() -> None:
         setattr(TokenManager, _MQTT_CREDS_PATCH_ATTR, True)
 
 
-def _register_device_with_properties(
+def _register_device_with_realtime_topics(
     self: MQTTTransport, product_key: str, device_name: str, iot_id: str
 ) -> None:
-    """Register Mammotion MQTT devices with property-state push topics enabled."""
+    """Register Mammotion MQTT devices with additional realtime push topics."""
     _original_register_device(self, product_key, device_name, iot_id)
-    self.add_topic(f"/sys/{product_key}/{device_name}/app/down/thing/properties")
+    base_topic = f"/sys/{product_key}/{device_name}"
+    for topic in (
+        f"{base_topic}/thing/event/+/post",
+        f"/sys/proto/{product_key}/{device_name}/thing/event/+/post",
+        f"{base_topic}/app/down/thing/status",
+        f"{base_topic}/app/down/thing/properties",
+        f"{base_topic}/app/down/thing/events",
+        f"{base_topic}/app/down/thing/model/down_raw",
+        f"{base_topic}/app/down/_thing/event/notify",
+        f"{base_topic}/app/down/thing/event/property/post_reply",
+        f"{base_topic}/thing/event/property/post",
+    ):
+        self.add_topic(topic)
 
 
 def _transport_auth_state_already_present() -> bool:
