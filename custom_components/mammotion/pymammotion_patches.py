@@ -163,32 +163,40 @@ def _mqtt_dispatch_proto_aware() -> bool:
         source = inspect.getsource(MQTTTransport._dispatch)  # noqa: SLF001
     except (OSError, TypeError):
         return False
-    return "is_proto_topic" in source or 'parts[2] == "proto"' in source
+    return "is_raw_proto" in source or (
+        ("is_proto_topic" in source or 'parts[2] == "proto"' in source)
+        and "down_raw" in source
+        and "on_device_message(iot_id, raw" in source
+    )
 
 
 async def _mqtt_dispatch_with_proto_routing(
     self: MQTTTransport, topic: str, raw: bytes
 ) -> None:
-    """Route Mammotion direct MQTT proto topics with the correct pk/dn offset."""
-    if not topic.startswith("/sys/proto/") or self.on_device_message is None:
+    """Route direct MQTT raw protobuf topics with the correct pk/dn offset."""
+    is_proto_topic = topic.startswith("/sys/proto/")
+    is_down_raw_topic = topic.endswith("/thing/model/down_raw")
+    if not (is_proto_topic or is_down_raw_topic) or self.on_device_message is None:
         await _original_mqtt_dispatch(self, topic, raw)
         return
 
     parts = topic.split("/")
-    if len(parts) < 5:
+    if len(parts) < (5 if is_proto_topic else 4):
         await _original_mqtt_dispatch(self, topic, raw)
         return
 
-    product_key = parts[3]
-    device_name = parts[4]
+    product_key = parts[3] if is_proto_topic else parts[2]
+    device_name = parts[4] if is_proto_topic else parts[3]
     iot_id = self._device_to_iot.get((product_key, device_name))
     if not iot_id:
-        _LOGGER.debug("MQTTTransport: could not route proto message on topic %s", topic)
+        _LOGGER.debug(
+            "MQTTTransport: could not route raw protobuf message on topic %s", topic
+        )
         return
 
     decoded = self._unwrap_envelope(topic, raw)
     if decoded is None:
-        return
+        decoded = raw
 
     await self.on_device_message(iot_id, decoded)
 
