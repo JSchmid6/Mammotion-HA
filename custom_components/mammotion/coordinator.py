@@ -105,6 +105,11 @@ CLOUD_REPORT_TRANSITION_INTERVAL = timedelta(seconds=15)
 CLOUD_REPORT_SEND_RESERVE = 40
 CLOUD_REPORT_CRITICAL_SEND_RESERVE = 10
 CLOUD_REPORT_BUDGET_LOG_INTERVAL = 3600.0
+CLOUD_REPORT_STREAM_DURATION = timedelta(minutes=30)
+CLOUD_REPORT_STREAM_RENEW_INTERVAL = timedelta(minutes=25)
+CLOUD_REPORT_STREAM_DURATION_MS = int(
+    CLOUD_REPORT_STREAM_DURATION.total_seconds() * 1000
+)
 COMMAND_WARNING_LOG_INTERVAL = 900.0
 
 
@@ -1407,6 +1412,8 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         self._on_stop: list[CALLBACK_TYPE] = []
         self.service_info: BluetoothServiceInfoBleak | None = None
         self._last_cloud_snapshot_at = 0.0
+        self._last_cloud_stream_start_at = 0.0
+        self._cloud_stream_requesting = False
         self._last_cloud_budget_log_at = 0.0
         self._last_cloud_snapshot_failure_log_at = 0.0
 
@@ -1566,6 +1573,21 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
 
         return CLOUD_REPORT_IDLE_INTERVAL
 
+    @staticmethod
+    def _is_active_report_state(device: MowingDevice) -> bool:
+        """Return True when the mower state needs near-realtime telemetry."""
+        try:
+            return int(device.report_data.dev.sys_status) in MOWING_ACTIVE_MODES
+        except (AttributeError, TypeError, ValueError):
+            return False
+
+    def _cloud_report_stream_recent(self) -> bool:
+        """Return True when an active cloud report stream was recently requested."""
+        return (
+            time.monotonic() - self._last_cloud_stream_start_at
+            < CLOUD_REPORT_STREAM_RENEW_INTERVAL.total_seconds()
+        )
+
     def _cloud_snapshot_budget_allows(self, *, priority: bool) -> bool:
         """Return True when a cloud snapshot should be allowed by the send budget."""
         if not self._cloud_enabled or not self.has_cloud_account:
@@ -1624,6 +1646,47 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
             exc,
         )
 
+    async def _async_ensure_active_report_stream(self, *, reason: str) -> bool:
+        """Start or renew a continuous report stream while the mower is active."""
+        if self._cloud_stream_requesting:
+            return True
+
+        if not self._is_active_report_state(self.data):
+            return False
+
+        if self._has_usable_ble_transport():
+            return True
+
+        if self._cloud_report_stream_recent():
+            return True
+
+        if not self.is_online() or not self._cloud_snapshot_budget_allows(
+            priority=True
+        ):
+            return False
+
+        self._cloud_stream_requesting = True
+        try:
+            await self.async_start_report_stream(CLOUD_REPORT_STREAM_DURATION_MS)
+        except (
+            DeviceOfflineException,
+            NoTransportAvailableError,
+            TransportRateLimitedError,
+            TooManyRequestsException,
+        ) as exc:
+            self._log_cloud_snapshot_failure(reason, exc)
+            return False
+        finally:
+            self._cloud_stream_requesting = False
+
+        self._last_cloud_stream_start_at = time.monotonic()
+        LOGGER.debug(
+            "report-coordinator [%s]: active cloud report stream requested for %s",
+            self.device_name,
+            reason,
+        )
+        return True
+
     async def _async_request_report_snapshot_guarded(
         self, *, priority: bool = False, reason: str
     ) -> None:
@@ -1655,9 +1718,18 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         ):
             return
 
+        if (
+            not priority
+            and self._is_active_report_state(self.data)
+            and self._cloud_report_stream_recent()
+        ):
+            return
+
         now = time.monotonic()
         interval = (
-            CLOUD_REPORT_TRANSITION_INTERVAL if priority else self._cloud_report_interval()
+            CLOUD_REPORT_TRANSITION_INTERVAL
+            if priority
+            else self._cloud_report_interval()
         ).total_seconds()
 
         if now - self._last_cloud_snapshot_at < interval:
@@ -1694,7 +1766,10 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         LOGGER.debug("Updated Mammotion device %s", self.device_name)
         self.update_failures = 0
         await self.async_save_data(device)
-        await self._async_request_report_snapshot_guarded(reason="periodic refresh")
+        if not await self._async_ensure_active_report_stream(
+            reason="periodic active refresh"
+        ):
+            await self._async_request_report_snapshot_guarded(reason="periodic refresh")
 
         if self.data.mower_state.ble_mac != "" and len(self._on_stop) == 0:
             self._on_stop.append(
@@ -1721,6 +1796,14 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
                         )
 
         return device
+
+    async def _on_state_changed(self, snapshot: DeviceSnapshot) -> None:
+        """Push updated device data to HA and maintain active report streaming."""
+        self.async_set_updated_data(snapshot.raw)
+        if self._is_active_report_state(cast(MowingDevice, snapshot.raw)):
+            self.hass.async_create_task(
+                self._async_ensure_active_report_stream(reason="active state update")
+            )
 
     async def _async_update_notification(self, res: tuple[str, Any | None]) -> None:
         """Update data from incoming messages."""
@@ -1798,6 +1881,16 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
 
     async def _on_sys_status_changed_refresh(self, sys_status: int) -> None:
         """Trigger a one-shot count=1 poll on sys_status transitions when not streaming."""
+        try:
+            active = int(sys_status) in MOWING_ACTIVE_MODES
+        except (TypeError, ValueError):
+            active = False
+
+        if active and await self._async_ensure_active_report_stream(
+            reason="sys_status active transition"
+        ):
+            return
+
         await self._async_request_report_snapshot_guarded(
             priority=True, reason="sys_status transition"
         )
