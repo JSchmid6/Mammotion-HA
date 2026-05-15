@@ -511,6 +511,20 @@
     }
   },
   "services": {
+    "request_report": {
+      "name": "Request mower report",
+      "description": "Requests a one-shot status report from the mower."
+    },
+    "start_report_stream": {
+      "name": "Start report stream",
+      "description": "Requests a temporary stream of mower status reports.",
+      "fields": {
+        "duration_seconds": {
+          "name": "Duration",
+          "description": "How long to keep requesting reports, in seconds."
+        }
+      }
+    },
     "cancel_job": {
       "name": "Cancel current task",
       "description": "Stops the mower and clears the current task."
