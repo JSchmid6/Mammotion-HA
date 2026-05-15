@@ -110,6 +110,7 @@ CLOUD_REPORT_STREAM_RENEW_INTERVAL = timedelta(minutes=25)
 CLOUD_REPORT_STREAM_DURATION_MS = int(
     CLOUD_REPORT_STREAM_DURATION.total_seconds() * 1000
 )
+CLOUD_REPORT_JOB_WATCH_DURATION = timedelta(hours=4)
 COMMAND_WARNING_LOG_INTERVAL = 900.0
 
 
@@ -1413,6 +1414,7 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         self.service_info: BluetoothServiceInfoBleak | None = None
         self._last_cloud_snapshot_at = 0.0
         self._last_cloud_stream_start_at = 0.0
+        self._job_watch_until = 0.0
         self._cloud_stream_requesting = False
         self._last_cloud_budget_log_at = 0.0
         self._last_cloud_snapshot_failure_log_at = 0.0
@@ -1543,6 +1545,11 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
 
     def _cloud_report_interval(self) -> timedelta:
         """Return a conservative cloud snapshot cadence for the current mower state."""
+        if self._continuous_report_watch_active() and self._is_recharge_pause_state(
+            self.data
+        ):
+            return CLOUD_REPORT_ACTIVE_INTERVAL
+
         dev = self.data.report_data.dev
         try:
             sys_status = int(dev.sys_status)
@@ -1580,6 +1587,60 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
             return int(device.report_data.dev.sys_status) in MOWING_ACTIVE_MODES
         except (AttributeError, TypeError, ValueError):
             return False
+
+    @staticmethod
+    def _has_unfinished_mow_job(device: MowingDevice) -> bool:
+        """Return True when report fields indicate a resumable unfinished job."""
+        try:
+            work = device.report_data.work
+            if int(work.bp_info) != 0:
+                return True
+
+            completion_percent = int(work.area) >> 16
+            if 0 < completion_percent < 100:
+                return True
+
+            left_time = int(work.progress) >> 16
+            return left_time > 0
+        except (AttributeError, TypeError, ValueError):
+            return False
+
+    @classmethod
+    def _is_recharge_pause_state(cls, device: MowingDevice) -> bool:
+        """Return True when a mower is docked/charging with an unfinished job."""
+        try:
+            dev = device.report_data.dev
+            sys_status = int(dev.sys_status)
+            if sys_status == int(WorkMode.MODE_CHARGING_PAUSE):
+                return True
+            return int(dev.charge_state) != 0 and cls._has_unfinished_mow_job(device)
+        except (AttributeError, TypeError, ValueError):
+            return False
+
+    def _continuous_report_watch_active(self) -> bool:
+        """Return True while an observed mowing job is still worth watching."""
+        return time.monotonic() < self._job_watch_until
+
+    def _needs_continuous_report_stream(self, device: MowingDevice) -> bool:
+        """Return True when state changes need report-stream freshness."""
+        if self._is_active_report_state(device):
+            return True
+        return self._continuous_report_watch_active() and self._is_recharge_pause_state(
+            device
+        )
+
+    def _update_continuous_report_watch(self, device: MowingDevice) -> None:
+        """Track active jobs across return-to-dock and recharge pauses."""
+        now = time.monotonic()
+        if self._is_active_report_state(device) or self._is_recharge_pause_state(device):
+            self._job_watch_until = max(
+                self._job_watch_until,
+                now + CLOUD_REPORT_JOB_WATCH_DURATION.total_seconds(),
+            )
+            return
+
+        if not self._has_unfinished_mow_job(device):
+            self._job_watch_until = 0.0
 
     def _cloud_report_stream_recent(self) -> bool:
         """Return True when an active cloud report stream was recently requested."""
@@ -1651,7 +1712,7 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         if self._cloud_stream_requesting:
             return True
 
-        if not self._is_active_report_state(self.data):
+        if not self._needs_continuous_report_stream(self.data):
             return False
 
         if self._has_usable_ble_transport():
@@ -1766,6 +1827,7 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         LOGGER.debug("Updated Mammotion device %s", self.device_name)
         self.update_failures = 0
         await self.async_save_data(device)
+        self._update_continuous_report_watch(device)
         if not await self._async_ensure_active_report_stream(
             reason="periodic active refresh"
         ):
@@ -1799,10 +1861,12 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
 
     async def _on_state_changed(self, snapshot: DeviceSnapshot) -> None:
         """Push updated device data to HA and maintain active report streaming."""
+        device = cast(MowingDevice, snapshot.raw)
+        self._update_continuous_report_watch(device)
         self.async_set_updated_data(snapshot.raw)
-        if self._is_active_report_state(cast(MowingDevice, snapshot.raw)):
+        if self._needs_continuous_report_stream(device):
             self.hass.async_create_task(
-                self._async_ensure_active_report_stream(reason="active state update")
+                self._async_ensure_active_report_stream(reason="job watch state update")
             )
 
     async def _async_update_notification(self, res: tuple[str, Any | None]) -> None:

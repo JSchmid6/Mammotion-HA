@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 import time
@@ -16,8 +17,10 @@ from pymammotion.transport.base import (
     TransportType,
 )
 from pymammotion.transport.mqtt import MQTTTransport
+from pymammotion.utility.constant.device_constant import WorkMode
 
 _SEND_MARKED_PATCH_ATTR = "_mammotion_ha_cloud_safe_send_marked"
+_START_REPORT_STREAM_PATCH_ATTR = "_mammotion_ha_job_watch_report_stream"
 _MQTT_REALTIME_TOPICS_PATCH_ATTR = "_mammotion_ha_mqtt_realtime_topics_patch"
 _MQTT_PROTO_DISPATCH_PATCH_ATTR = "_mammotion_ha_mqtt_proto_dispatch_patch"
 _TRANSPORT_AUTH_PATCH_ATTR = "_mammotion_ha_transport_auth_state_patch"
@@ -31,6 +34,7 @@ _LOGGER = logging.getLogger(__name__)
 _last_patch_warning_log_at: dict[str, float] = {}
 
 _original_register_device = MQTTTransport.register_device
+_original_start_report_stream = DeviceHandle.start_report_stream
 _original_mqtt_dispatch = MQTTTransport._dispatch  # noqa: SLF001
 _original_mqtt_send = MQTTTransport.send
 _original_force_refresh_invoke_token = TokenManager.force_refresh_invoke_token
@@ -83,12 +87,84 @@ async def _send_marked_cloud_safe(
     await transport.send(payload, iot_id=self.iot_id)
 
 
+def _start_report_stream_allows_job_watch() -> bool:
+    """Return True when upstream streams through recharge-pause job watches."""
+    try:
+        source = inspect.getsource(DeviceHandle.start_report_stream)
+    except (OSError, TypeError):
+        return False
+    return "MODE_CHARGING_PAUSE" in source and "bp_info" in source
+
+
+def _has_unfinished_mow_job(self: DeviceHandle) -> bool:
+    """Return True when current report data points to a resumable job."""
+    try:
+        work = self.state_machine.current.raw.report_data.work
+        if int(work.bp_info) != 0:
+            return True
+
+        completion_percent = int(work.area) >> 16
+        if 0 < completion_percent < 100:
+            return True
+
+        left_time = int(work.progress) >> 16
+        return left_time > 0
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def _is_recharge_pause_report_state(self: DeviceHandle) -> bool:
+    """Return True when the mower is charging but a job still needs watching."""
+    try:
+        dev = self.state_machine.current.raw.report_data.dev
+        if int(dev.sys_status) == int(WorkMode.MODE_CHARGING_PAUSE):
+            return True
+        return int(dev.charge_state) != 0 and _has_unfinished_mow_job(self)
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+async def _start_report_stream_job_watch(
+    self: DeviceHandle, duration_ms: int = 300_000
+) -> None:
+    """Start a report stream for active jobs, including charging pauses."""
+    if not _is_recharge_pause_report_state(self):
+        await _original_start_report_stream(self, duration_ms)
+        return
+
+    already_streaming = self._report_stream_timer is not None  # noqa: SLF001
+
+    if self._report_stream_timer is not None:  # noqa: SLF001
+        self._report_stream_timer.cancel()  # noqa: SLF001
+        self._report_stream_timer = None  # noqa: SLF001
+
+    if not self._ble_stream_active:  # noqa: SLF001
+        if already_streaming:
+            await self._send_report_stream_keep()  # noqa: SLF001
+        else:
+            await self._send_report_stream_start(duration_ms)  # noqa: SLF001
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    self._report_stream_timer = loop.call_later(  # noqa: SLF001
+        duration_ms / 1000, self._fire_report_stream_stop  # noqa: SLF001
+    )
+
+
 def apply_pymammotion_patches() -> None:
     """Apply pymammotion compatibility patches once."""
     if not getattr(DeviceHandle, _SEND_MARKED_PATCH_ATTR, False):
         if not _send_marked_already_cloud_safe():
             setattr(DeviceHandle, "_send_marked", _send_marked_cloud_safe)
         setattr(DeviceHandle, _SEND_MARKED_PATCH_ATTR, True)
+
+    if not _start_report_stream_allows_job_watch() and not getattr(
+        DeviceHandle, _START_REPORT_STREAM_PATCH_ATTR, False
+    ):
+        setattr(DeviceHandle, "start_report_stream", _start_report_stream_job_watch)
+        setattr(DeviceHandle, _START_REPORT_STREAM_PATCH_ATTR, True)
 
     if not getattr(MQTTTransport, _MQTT_REALTIME_TOPICS_PATCH_ATTR, False):
         setattr(MQTTTransport, "register_device", _register_device_with_realtime_topics)
