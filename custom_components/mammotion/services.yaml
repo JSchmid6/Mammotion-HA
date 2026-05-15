@@ -1,3 +1,24 @@
+request_report:
+  target:
+    entity:
+      integration: mammotion
+      domain: lawn_mower
+start_report_stream:
+  target:
+    entity:
+      integration: mammotion
+      domain: lawn_mower
+  fields:
+    duration_seconds:
+      example: 300
+      default: 300
+      required: false
+      selector:
+        number:
+          min: 10
+          max: 1800
+          mode: box
+          unit_of_measurement: s
 cancel_job:
   target:
     entity:

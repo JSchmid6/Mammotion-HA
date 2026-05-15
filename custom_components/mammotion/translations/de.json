@@ -511,6 +511,20 @@
     }
   },
   "services": {
+    "request_report": {
+      "name": "Mäherbericht anfordern",
+      "description": "Fordert einmalig einen Statusbericht vom Mähroboter an."
+    },
+    "start_report_stream": {
+      "name": "Berichtsstream starten",
+      "description": "Fordert vorübergehend laufende Statusberichte vom Mähroboter an.",
+      "fields": {
+        "duration_seconds": {
+          "name": "Dauer",
+          "description": "Wie lange Berichte angefordert werden sollen, in Sekunden."
+        }
+      }
+    },
     "cancel_job": {
       "name": "Aktuelle Aufgabe abbrechen",
       "description": "Stoppt den Mähroboter und bereinigt die aktuelle Aufgabe."
