@@ -111,6 +111,21 @@ CLOUD_REPORT_STREAM_DURATION_MS = int(
     CLOUD_REPORT_STREAM_DURATION.total_seconds() * 1000
 )
 CLOUD_REPORT_JOB_WATCH_DURATION = timedelta(hours=4)
+CLOUD_REPORT_PAUSE_GRACE = timedelta(minutes=5)
+CLOUD_REPORT_STREAM_STATES = frozenset(
+    {
+        int(WorkMode.MODE_WORKING),
+        int(WorkMode.MODE_RETURNING),
+        int(WorkMode.MODE_CHARGING_PAUSE),
+    }
+)
+CLOUD_REPORT_ERROR_STATES = frozenset(
+    {
+        int(WorkMode.MODE_LOCK),
+        int(WorkMode.MODE_LOCATION_ERROR),
+        int(WorkMode.MODE_BOUNDARY_JUMP),
+    }
+)
 COMMAND_WARNING_LOG_INTERVAL = 900.0
 
 
@@ -1415,6 +1430,9 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         self._last_cloud_snapshot_at = 0.0
         self._last_cloud_stream_start_at = 0.0
         self._job_watch_until = 0.0
+        self._pause_watch_until = 0.0
+        self._last_report_sys_status: int | None = None
+        self._pause_stream_stop_unsub: CALLBACK_TYPE | None = None
         self._cloud_stream_requesting = False
         self._last_cloud_budget_log_at = 0.0
         self._last_cloud_snapshot_failure_log_at = 0.0
@@ -1427,6 +1445,11 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
             function=self._add_ble_device,
             background=True,
         )
+
+    async def async_shutdown(self) -> None:
+        """Cancel report-watch timers and subscriptions on shutdown."""
+        self._cancel_pause_stream_stop()
+        await super().async_shutdown()
 
     @callback
     def _async_handle_bluetooth_event(
@@ -1545,9 +1568,7 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
 
     def _cloud_report_interval(self) -> timedelta:
         """Return a conservative cloud snapshot cadence for the current mower state."""
-        if self._continuous_report_watch_active() and self._is_recharge_pause_state(
-            self.data
-        ):
+        if self._needs_continuous_report_stream(self.data):
             return CLOUD_REPORT_ACTIVE_INTERVAL
 
         dev = self.data.report_data.dev
@@ -1556,8 +1577,8 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         except (TypeError, ValueError):
             return CLOUD_REPORT_IDLE_INTERVAL
 
-        if sys_status in MOWING_ACTIVE_MODES:
-            return CLOUD_REPORT_ACTIVE_INTERVAL
+        if sys_status in CLOUD_REPORT_ERROR_STATES:
+            return CLOUD_REPORT_IDLE_INTERVAL
 
         try:
             if int(dev.charge_state) != 0:
@@ -1584,7 +1605,19 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
     def _is_active_report_state(device: MowingDevice) -> bool:
         """Return True when the mower state needs near-realtime telemetry."""
         try:
-            return int(device.report_data.dev.sys_status) in MOWING_ACTIVE_MODES
+            return int(device.report_data.dev.sys_status) in CLOUD_REPORT_STREAM_STATES
+        except (AttributeError, TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _is_pause_report_state(device: MowingDevice) -> bool:
+        """Return True when the mower is paused away from the dock."""
+        try:
+            dev = device.report_data.dev
+            return (
+                int(dev.sys_status) == int(WorkMode.MODE_PAUSE)
+                and int(dev.charge_state) == 0
+            )
         except (AttributeError, TypeError, ValueError):
             return False
 
@@ -1621,9 +1654,19 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         """Return True while an observed mowing job is still worth watching."""
         return time.monotonic() < self._job_watch_until
 
+    def _pause_report_watch_active(self) -> bool:
+        """Return True during the short grace window after a pause transition."""
+        return time.monotonic() < self._pause_watch_until
+
     def _needs_continuous_report_stream(self, device: MowingDevice) -> bool:
         """Return True when state changes need report-stream freshness."""
         if self._is_active_report_state(device):
+            return True
+        if (
+            self._pause_report_watch_active()
+            and self._is_pause_report_state(device)
+            and self._has_unfinished_mow_job(device)
+        ):
             return True
         return self._continuous_report_watch_active() and self._is_recharge_pause_state(
             device
@@ -1632,15 +1675,115 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
     def _update_continuous_report_watch(self, device: MowingDevice) -> None:
         """Track active jobs across return-to-dock and recharge pauses."""
         now = time.monotonic()
+        sys_status = self._safe_sys_status(device)
         if self._is_active_report_state(device) or self._is_recharge_pause_state(device):
             self._job_watch_until = max(
                 self._job_watch_until,
                 now + CLOUD_REPORT_JOB_WATCH_DURATION.total_seconds(),
             )
+            self._pause_watch_until = 0.0
+            self._cancel_pause_stream_stop()
+            self._last_report_sys_status = sys_status
             return
+
+        if (
+            self._is_pause_report_state(device)
+            and self._continuous_report_watch_active()
+            and self._has_unfinished_mow_job(device)
+        ):
+            if self._last_report_sys_status != int(WorkMode.MODE_PAUSE):
+                self._pause_watch_until = now + CLOUD_REPORT_PAUSE_GRACE.total_seconds()
+                self._schedule_pause_stream_stop()
+            self._last_report_sys_status = sys_status
+            return
+
+        if not self._is_pause_report_state(device):
+            self._pause_watch_until = 0.0
+            self._cancel_pause_stream_stop()
 
         if not self._has_unfinished_mow_job(device):
             self._job_watch_until = 0.0
+            self._pause_watch_until = 0.0
+            self._cancel_pause_stream_stop()
+
+        self._last_report_sys_status = sys_status
+
+    @staticmethod
+    def _safe_sys_status(device: MowingDevice) -> int | None:
+        """Return sys_status as int when available."""
+        try:
+            return int(device.report_data.dev.sys_status)
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    def _cancel_pause_stream_stop(self) -> None:
+        """Cancel a scheduled pause stream stop callback."""
+        if self._pause_stream_stop_unsub is None:
+            return
+        self._pause_stream_stop_unsub()
+        self._pause_stream_stop_unsub = None
+
+    def _schedule_pause_stream_stop(self) -> None:
+        """Stop a report stream if a normal pause lasts past the grace window."""
+        self._cancel_pause_stream_stop()
+
+        @callback
+        def _handle_pause_stream_stop(_: datetime.datetime) -> None:
+            self._pause_stream_stop_unsub = None
+            self.hass.async_create_task(
+                self._async_stop_report_stream_if_pause(reason="pause grace elapsed")
+            )
+
+        self._pause_stream_stop_unsub = async_call_later(
+            self.hass,
+            CLOUD_REPORT_PAUSE_GRACE.total_seconds(),
+            _handle_pause_stream_stop,
+        )
+
+    async def _async_stop_report_stream_if_pause(self, *, reason: str) -> None:
+        """Stop a cloud report stream when a normal pause becomes long-lived."""
+        if self._needs_continuous_report_stream(self.data):
+            return
+        if not self._is_pause_report_state(self.data):
+            return
+
+        await self._async_stop_report_stream(reason=reason)
+
+    async def _async_stop_report_stream(self, *, reason: str) -> None:
+        """Best-effort stop for a transient cloud report stream."""
+        handle = self.manager.mower(self.device_name)
+        if handle is None or self._has_usable_ble_transport():
+            return
+
+        stream_timer = getattr(handle, "_report_stream_timer", None)
+        if stream_timer is None and not self._cloud_report_stream_recent():
+            return
+
+        if stream_timer is not None:
+            stream_timer.cancel()
+            setattr(handle, "_report_stream_timer", None)
+
+        stop_stream = getattr(handle, "_send_report_stream_stop", None)
+        if stop_stream is None:
+            return
+
+        try:
+            await stop_stream()
+        except (
+            DeviceOfflineException,
+            NoTransportAvailableError,
+            TransportRateLimitedError,
+            TooManyRequestsException,
+        ) as exc:
+            self._log_cloud_snapshot_failure(reason, exc)
+            return
+
+        self._last_cloud_stream_start_at = 0.0
+        LOGGER.debug(
+            "report-coordinator [%s]: cloud report stream stopped for %s",
+            self.device_name,
+            reason,
+        )
 
     def _cloud_report_stream_recent(self) -> bool:
         """Return True when an active cloud report stream was recently requested."""
@@ -1781,7 +1924,7 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
 
         if (
             not priority
-            and self._is_active_report_state(self.data)
+            and self._needs_continuous_report_stream(self.data)
             and self._cloud_report_stream_recent()
         ):
             return
@@ -1946,12 +2089,14 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
     async def _on_sys_status_changed_refresh(self, sys_status: int) -> None:
         """Trigger a one-shot count=1 poll on sys_status transitions when not streaming."""
         try:
-            active = int(sys_status) in MOWING_ACTIVE_MODES
+            stream_candidate = int(sys_status) in CLOUD_REPORT_STREAM_STATES or int(
+                sys_status
+            ) == int(WorkMode.MODE_PAUSE)
         except (TypeError, ValueError):
-            active = False
+            stream_candidate = False
 
-        if active and await self._async_ensure_active_report_stream(
-            reason="sys_status active transition"
+        if stream_candidate and await self._async_ensure_active_report_stream(
+            reason="sys_status watched transition"
         ):
             return
 
@@ -2393,6 +2538,8 @@ class MammotionDeviceErrorUpdateCoordinator(
             WorkMode.MODE_RETURNING,
             WorkMode.MODE_LOCK,
             WorkMode.MODE_PAUSE,
+            WorkMode.MODE_LOCATION_ERROR,
+            WorkMode.MODE_BOUNDARY_JUMP,
         ):
             await self.async_send_and_wait(
                 "read_write_device", "bidire_comm_cmd", rw_id=5, rw=1, context=2
