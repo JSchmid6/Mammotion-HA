@@ -105,6 +105,7 @@ from .report_policy import (
     is_recharge_pause_state,
     needs_continuous_report_stream,
     report_policy_state_from_device,
+    report_transition_rejection_reason,
 )
 
 if TYPE_CHECKING:
@@ -1426,6 +1427,8 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         self._cloud_stream_requesting = False
         self._last_cloud_budget_log_at = 0.0
         self._last_cloud_snapshot_failure_log_at = 0.0
+        self._last_accepted_report_at = 0.0
+        self._last_report_sanity_log_at = 0.0
 
         self.poll_debouncer = Debouncer(
             hass,
@@ -1578,6 +1581,45 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
             report_policy_state_from_device(device),
             continuous_watch_active=self._continuous_report_watch_active(),
             pause_watch_active=self._pause_report_watch_active(),
+        )
+
+    def _accept_report_device(self, device: MowingDevice, *, source: str) -> bool:
+        """Return True when a report device is plausible enough to publish."""
+        now = time.monotonic()
+        if self._last_accepted_report_at:
+            reason = report_transition_rejection_reason(
+                report_policy_state_from_device(self.data),
+                report_policy_state_from_device(device),
+                elapsed=timedelta(seconds=now - self._last_accepted_report_at),
+            )
+            if reason is not None:
+                self._log_rejected_report(source, reason)
+                return False
+
+        self._last_accepted_report_at = now
+        self._update_continuous_report_watch(device)
+        return True
+
+    def _publish_report_device(self, device: MowingDevice, *, source: str) -> bool:
+        """Publish a report device when it passes sanity checks."""
+        if not self._accept_report_device(device, source=source):
+            return False
+        self.async_set_updated_data(device)
+        return True
+
+    def _log_rejected_report(self, source: str, reason: str) -> None:
+        """Rate-limit warnings for implausible Mammotion report transitions."""
+        now = time.monotonic()
+        if now - self._last_report_sanity_log_at < CLOUD_REPORT_BUDGET_LOG_INTERVAL:
+            return
+        self._last_report_sanity_log_at = now
+        LOGGER.warning(
+            "report-coordinator [%s]: rejected %s report because %s; "
+            "keeping the previous mower status until Mammotion publishes "
+            "a plausible follow-up",
+            self.device_name,
+            source,
+            reason,
         )
 
     def _update_continuous_report_watch(self, device: MowingDevice) -> None:
@@ -1878,8 +1920,10 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
 
         LOGGER.debug("Updated Mammotion device %s", self.device_name)
         self.update_failures = 0
+        if not self._accept_report_device(device, source="periodic refresh"):
+            return self.data
+
         await self.async_save_data(device)
-        self._update_continuous_report_watch(device)
         if not await self._async_ensure_active_report_stream(
             reason="periodic active refresh"
         ):
@@ -1914,8 +1958,8 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
     async def _on_state_changed(self, snapshot: DeviceSnapshot) -> None:
         """Push updated device data to HA and maintain active report streaming."""
         device = cast(MowingDevice, snapshot.raw)
-        self._update_continuous_report_watch(device)
-        self.async_set_updated_data(snapshot.raw)
+        if not self._publish_report_device(device, source="state-changed"):
+            return
         if self._needs_continuous_report_stream(device):
             self.hass.async_create_task(
                 self._async_ensure_active_report_stream(reason="job watch state update")
@@ -1924,7 +1968,7 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
     async def _async_update_notification(self, res: tuple[str, Any | None]) -> None:
         """Update data from incoming messages."""
         if device := self.manager.get_device_by_name(self.device_name):
-            self.async_set_updated_data(device)
+            self._publish_report_device(device, source="notification")
 
     async def _async_update_properties(
         self, properties: ThingPropertiesMessage
@@ -1954,7 +1998,7 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         if not self.is_online():
             await self.set_scheduled_updates(True)
         if device := self.manager.get_device_by_name(self.device_name):
-            self.async_set_updated_data(device)
+            self._publish_report_device(device, source="event")
 
     async def _async_setup(self) -> None:
         await super()._async_setup()

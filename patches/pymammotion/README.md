@@ -61,3 +61,20 @@ git requirements in the form:
   "pymammotion@git+https://github.com/<user>/PyMammotion.git@<git-ref>"
 ]
 ```
+
+## Report sanity guard
+
+Target: `pymammotion` 0.7.109 and 0.7.110.
+
+Mammotion can publish stale-looking full-charge report snapshots while the mower
+is still away from the dock. The observed failure was a mower report sequence
+that jumped from 64% to 100% and back to 64% within roughly a minute, together
+with a matching RSSI/location jump. The raw values are upstream of HA, but
+publishing a single impossible snapshot can make automations treat the mower as
+docked or charging.
+
+The HA runtime patch wraps `MowerStateReducer.apply()` and rejects fresh
+`toapp_report_data` snapshots with an implausible jump to near-full battery.
+The HA coordinator keeps the same check as a second safety net, so future
+upstream `pymammotion` changes cannot accidentally re-expose the bad state to
+Home Assistant automations.

@@ -227,7 +227,7 @@ class MammotionLawnMowerEntity(MammotionBaseEntity, LawnMowerEntity):  # type: i
         return None
 
     def _ready_state_is_docked(self) -> bool:
-        """Return True when MODE_READY most likely means the mower is docked."""
+        """Return True when MODE_READY has direct dock evidence."""
         status = self.rpt_dev_status
         try:
             if int(status.charge_state) != 0:
@@ -235,16 +235,7 @@ class MammotionLawnMowerEntity(MammotionBaseEntity, LawnMowerEntity):  # type: i
         except (TypeError, ValueError):
             pass
 
-        try:
-            if int(status.battery_val) >= 100:
-                return True
-        except (TypeError, ValueError):
-            pass
-
-        try:
-            return int(status.last_status) == int(WorkMode.MODE_RETURNING)
-        except (TypeError, ValueError):
-            return False
+        return False
 
     async def async_start_mowing(self, **kwargs: Any) -> None:
         """Start mowing."""
