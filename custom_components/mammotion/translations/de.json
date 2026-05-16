@@ -240,6 +240,14 @@
         }
       }
     },
+    "binary_sensor": {
+      "charging": {
+        "name": "Lädt"
+      },
+      "dock_access_needed": {
+        "name": "Dock-Zugang benötigt"
+      }
+    },
     "button": {
       "start_map_sync": {
         "name": "Synchronisiere Karte"

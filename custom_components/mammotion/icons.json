@@ -75,6 +75,11 @@
         "default": "mdi:land-plots-marker"
       }
     },
+    "binary_sensor": {
+      "dock_access_needed": {
+        "default": "mdi:garage-open"
+      }
+    },
     "select": {
       "channel_mode": {
         "default": "mdi:map-marker-path",

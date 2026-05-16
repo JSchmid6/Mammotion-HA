@@ -61,8 +61,8 @@ def encoded_high_word(value: int) -> int:
         int(policy.WorkMode.MODE_CHARGING_PAUSE),
     ],
 )
-def test_active_states_use_report_stream_cadence(sys_status: int) -> None:
-    """Active report states stay on the fast cadence."""
+def test_active_states_use_active_or_critical_cadence(sys_status: int) -> None:
+    """Active report states stay on the active cadence or faster critical cadence."""
     state = make_state(sys_status=sys_status)
 
     assert policy.needs_continuous_report_stream(
@@ -70,6 +70,68 @@ def test_active_states_use_report_stream_cadence(sys_status: int) -> None:
         continuous_watch_active=False,
         pause_watch_active=False,
     )
+    expected_interval = (
+        policy.CLOUD_REPORT_DOCK_ACCESS_INTERVAL
+        if policy.needs_dock_access_watch(state)
+        else policy.CLOUD_REPORT_ACTIVE_INTERVAL
+    )
+    assert (
+        policy.cloud_report_interval(
+            state,
+            continuous_watch_active=False,
+            pause_watch_active=False,
+        )
+        == expected_interval
+    )
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        make_state(
+            sys_status=int(policy.WorkMode.MODE_WORKING),
+            work_progress=encoded_high_word(10),
+        ),
+        make_state(
+            sys_status=int(policy.WorkMode.MODE_WORKING),
+            work_area=encoded_high_word(95),
+        ),
+        make_state(sys_status=int(policy.WorkMode.MODE_RETURNING)),
+    ],
+)
+def test_dock_access_watch_uses_critical_cadence(state: Any) -> None:
+    """Near-finish and returning states need enough lead time for garage access."""
+    assert policy.needs_dock_access_watch(state)
+    assert (
+        policy.cloud_report_interval(
+            state,
+            continuous_watch_active=False,
+            pause_watch_active=False,
+        )
+        == policy.CLOUD_REPORT_DOCK_ACCESS_INTERVAL
+    )
+
+
+def test_dock_access_watch_ignores_docked_charge_state() -> None:
+    """Already charging states should not keep the garage-access poll alive."""
+    state = make_state(
+        sys_status=int(policy.WorkMode.MODE_RETURNING),
+        charge_state=1,
+        work_progress=encoded_high_word(5),
+    )
+
+    assert not policy.needs_dock_access_watch(state)
+
+
+def test_dock_access_watch_does_not_start_too_early() -> None:
+    """Normal mowing keeps the cheaper active cadence until the final window."""
+    state = make_state(
+        sys_status=int(policy.WorkMode.MODE_WORKING),
+        work_progress=encoded_high_word(20),
+        work_area=encoded_high_word(50),
+    )
+
+    assert not policy.needs_dock_access_watch(state)
     assert (
         policy.cloud_report_interval(
             state,

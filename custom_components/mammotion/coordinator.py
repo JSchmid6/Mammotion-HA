@@ -91,6 +91,8 @@ from .const import (
 from .report_policy import (
     CLOUD_REPORT_BUDGET_LOG_INTERVAL,
     CLOUD_REPORT_CRITICAL_SEND_RESERVE,
+    CLOUD_REPORT_DOCK_ACCESS_INTERVAL,
+    CLOUD_REPORT_DOCK_ACCESS_WATCH_DURATION,
     CLOUD_REPORT_JOB_WATCH_DURATION,
     CLOUD_REPORT_PAUSE_GRACE,
     CLOUD_REPORT_SEND_RESERVE,
@@ -103,6 +105,7 @@ from .report_policy import (
     is_active_report_state,
     is_pause_report_state,
     is_recharge_pause_state,
+    needs_dock_access_watch,
     needs_continuous_report_stream,
     report_policy_state_from_device,
     report_transition_rejection_reason,
@@ -1422,9 +1425,12 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         self._last_cloud_stream_start_at = 0.0
         self._job_watch_until = 0.0
         self._pause_watch_until = 0.0
+        self._dock_access_watch_until = 0.0
         self._last_report_sys_status: int | None = None
         self._pause_stream_stop_unsub: CALLBACK_TYPE | None = None
+        self._dock_access_poll_unsub: CALLBACK_TYPE | None = None
         self._cloud_stream_requesting = False
+        self._dock_access_poll_requesting = False
         self._last_cloud_budget_log_at = 0.0
         self._last_cloud_snapshot_failure_log_at = 0.0
         self._last_accepted_report_at = 0.0
@@ -1442,6 +1448,7 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
     async def async_shutdown(self) -> None:
         """Cancel report-watch timers and subscriptions on shutdown."""
         self._cancel_pause_stream_stop()
+        self._cancel_dock_access_poll()
         await super().async_shutdown()
 
     @callback
@@ -1575,6 +1582,10 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         """Return True during the short grace window after a pause transition."""
         return time.monotonic() < self._pause_watch_until
 
+    def _dock_access_report_watch_active(self) -> bool:
+        """Return True while the mower may soon need physical dock access."""
+        return time.monotonic() < self._dock_access_watch_until
+
     def _needs_continuous_report_stream(self, device: MowingDevice) -> bool:
         """Return True when state changes need report-stream freshness."""
         return needs_continuous_report_stream(
@@ -1582,6 +1593,10 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
             continuous_watch_active=self._continuous_report_watch_active(),
             pause_watch_active=self._pause_report_watch_active(),
         )
+
+    def _needs_dock_access_report_watch(self, device: MowingDevice) -> bool:
+        """Return True when the critical return-to-dock window is active."""
+        return needs_dock_access_watch(report_policy_state_from_device(device))
 
     def _accept_report_device(self, device: MowingDevice, *, source: str) -> bool:
         """Return True when a report device is plausible enough to publish."""
@@ -1598,6 +1613,7 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
 
         self._last_accepted_report_at = now
         self._update_continuous_report_watch(device)
+        self._update_dock_access_report_watch(device)
         return True
 
     def _publish_report_device(self, device: MowingDevice, *, source: str) -> bool:
@@ -1690,6 +1706,73 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
             CLOUD_REPORT_PAUSE_GRACE.total_seconds(),
             _handle_pause_stream_stop,
         )
+
+    def _update_dock_access_report_watch(self, device: MowingDevice) -> None:
+        """Start or stop the critical dock-access snapshot loop."""
+        now = time.monotonic()
+        if self._needs_dock_access_report_watch(device):
+            self._dock_access_watch_until = max(
+                self._dock_access_watch_until,
+                now + CLOUD_REPORT_DOCK_ACCESS_WATCH_DURATION.total_seconds(),
+            )
+            self._schedule_dock_access_poll()
+            return
+
+        self._dock_access_watch_until = 0.0
+        self._cancel_dock_access_poll()
+
+    def _cancel_dock_access_poll(self) -> None:
+        """Cancel a scheduled dock-access poll callback."""
+        if self._dock_access_poll_unsub is None:
+            return
+        self._dock_access_poll_unsub()
+        self._dock_access_poll_unsub = None
+
+    def _schedule_dock_access_poll(self) -> None:
+        """Schedule the next critical dock-access status snapshot."""
+        if self._dock_access_poll_unsub is not None:
+            return
+        if not self._dock_access_report_watch_active():
+            return
+
+        @callback
+        def _handle_dock_access_poll(_: datetime.datetime) -> None:
+            self._dock_access_poll_unsub = None
+            self.hass.async_create_task(self._async_dock_access_poll_tick())
+
+        self._dock_access_poll_unsub = async_call_later(
+            self.hass,
+            CLOUD_REPORT_DOCK_ACCESS_INTERVAL.total_seconds(),
+            _handle_dock_access_poll,
+        )
+
+    async def _async_dock_access_poll_tick(self) -> None:
+        """Poll during the short window where a closed dock door is dangerous."""
+        if self._dock_access_poll_requesting:
+            return
+
+        if (
+            not self._dock_access_report_watch_active()
+            or not self._needs_dock_access_report_watch(self.data)
+        ):
+            self._dock_access_watch_until = 0.0
+            return
+
+        self._dock_access_poll_requesting = True
+        try:
+            await self._async_ensure_active_report_stream(reason="dock access watch")
+            await self._async_request_report_snapshot_guarded(
+                priority=True,
+                reason="dock access watch",
+            )
+        finally:
+            self._dock_access_poll_requesting = False
+
+        if (
+            self._dock_access_report_watch_active()
+            and self._needs_dock_access_report_watch(self.data)
+        ):
+            self._schedule_dock_access_poll()
 
     async def _async_stop_report_stream_if_pause(self, *, reason: str) -> None:
         """Stop a cloud report stream when a normal pause becomes long-lived."""

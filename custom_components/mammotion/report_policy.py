@@ -12,6 +12,7 @@ CLOUD_REPORT_ACTIVE_INTERVAL = timedelta(seconds=30)
 CLOUD_REPORT_IDLE_INTERVAL = timedelta(minutes=15)
 CLOUD_REPORT_FIELD_ERROR_INTERVAL = timedelta(minutes=10)
 CLOUD_REPORT_DOCKED_INTERVAL = timedelta(minutes=60)
+CLOUD_REPORT_DOCK_ACCESS_INTERVAL = timedelta(seconds=15)
 CLOUD_REPORT_TRANSITION_INTERVAL = timedelta(seconds=15)
 CLOUD_REPORT_SEND_RESERVE = 40
 CLOUD_REPORT_CRITICAL_SEND_RESERVE = 10
@@ -23,6 +24,9 @@ CLOUD_REPORT_STREAM_DURATION_MS = int(
 )
 CLOUD_REPORT_JOB_WATCH_DURATION = timedelta(hours=4)
 CLOUD_REPORT_PAUSE_GRACE = timedelta(minutes=5)
+CLOUD_REPORT_DOCK_ACCESS_WATCH_DURATION = timedelta(minutes=30)
+DOCK_ACCESS_LEFT_TIME_THRESHOLD = 10
+DOCK_ACCESS_PROGRESS_THRESHOLD = 95
 REPORT_SANITY_RECENT_WINDOW = timedelta(minutes=5)
 REPORT_SANITY_BATTERY_JUMP = 20
 REPORT_SANITY_FULL_BATTERY = 95
@@ -78,6 +82,9 @@ def cloud_report_interval(
     pause_watch_active: bool,
 ) -> timedelta:
     """Return the cloud snapshot cadence for a mower report state."""
+    if needs_dock_access_watch(state):
+        return CLOUD_REPORT_DOCK_ACCESS_INTERVAL
+
     if needs_continuous_report_stream(
         state,
         continuous_watch_active=continuous_watch_active,
@@ -123,6 +130,37 @@ def is_active_report_state(state: ReportPolicyState) -> bool:
 def is_pause_report_state(state: ReportPolicyState) -> bool:
     """Return True when the mower is paused away from the dock."""
     return state.sys_status == int(WorkMode.MODE_PAUSE) and state.charge_state == 0
+
+
+def needs_dock_access_watch(state: ReportPolicyState) -> bool:
+    """Return True when automation should prepare access to the dock."""
+    if state.charge_state is not None and state.charge_state != 0:
+        return False
+
+    if state.sys_status in {
+        int(WorkMode.MODE_RETURNING),
+        int(WorkMode.MODE_CHARGING_PAUSE),
+    }:
+        return True
+
+    if state.sys_status != int(WorkMode.MODE_WORKING):
+        return False
+
+    return is_near_mow_completion(state)
+
+
+def is_near_mow_completion(state: ReportPolicyState) -> bool:
+    """Return True when reported job progress is close to automatic return."""
+    if state.work_progress is not None:
+        left_time = state.work_progress >> 16
+        if 0 < left_time <= DOCK_ACCESS_LEFT_TIME_THRESHOLD:
+            return True
+
+    if state.work_area is None:
+        return False
+
+    completion_percent = state.work_area >> 16
+    return DOCK_ACCESS_PROGRESS_THRESHOLD <= completion_percent < 100
 
 
 def is_docked_report_state(state: ReportPolicyState) -> bool:
