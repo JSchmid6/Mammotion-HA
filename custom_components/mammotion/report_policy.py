@@ -23,6 +23,9 @@ CLOUD_REPORT_STREAM_DURATION_MS = int(
 )
 CLOUD_REPORT_JOB_WATCH_DURATION = timedelta(hours=4)
 CLOUD_REPORT_PAUSE_GRACE = timedelta(minutes=5)
+REPORT_SANITY_RECENT_WINDOW = timedelta(minutes=5)
+REPORT_SANITY_BATTERY_JUMP = 20
+REPORT_SANITY_FULL_BATTERY = 95
 CLOUD_REPORT_STREAM_STATES = frozenset(
     {
         int(WorkMode.MODE_WORKING),
@@ -128,7 +131,32 @@ def is_docked_report_state(state: ReportPolicyState) -> bool:
         return True
     if state.sys_status != int(WorkMode.MODE_READY):
         return False
-    return state.battery_val == 100 or state.last_status == int(WorkMode.MODE_RETURNING)
+    return state.battery_val == 100
+
+
+def report_transition_rejection_reason(
+    previous: ReportPolicyState,
+    current: ReportPolicyState,
+    *,
+    elapsed: timedelta,
+) -> str | None:
+    """Return why a report transition is implausible, or None when accepted."""
+    if elapsed > REPORT_SANITY_RECENT_WINDOW:
+        return None
+    if previous.battery_val is None or current.battery_val is None:
+        return None
+
+    battery_delta = current.battery_val - previous.battery_val
+    if battery_delta < REPORT_SANITY_BATTERY_JUMP:
+        return None
+
+    if current.battery_val < REPORT_SANITY_FULL_BATTERY:
+        return None
+
+    return (
+        "implausible recent battery jump "
+        f"{previous.battery_val}->{current.battery_val} in {elapsed}"
+    )
 
 
 def is_field_error_state(state: ReportPolicyState) -> bool:

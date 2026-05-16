@@ -6,9 +6,15 @@ import asyncio
 import inspect
 import logging
 import time
+from copy import deepcopy
+from datetime import timedelta
+from typing import Any
 
+import betterproto2
 from pymammotion.auth.token_manager import MQTTCredentials, TokenManager
+from pymammotion.data.model.report_info import ReportData
 from pymammotion.device.handle import DeviceHandle
+from pymammotion.device.state_reducer import MowerStateReducer
 from pymammotion.transport.base import (
     AuthError,
     ReLoginRequiredError,
@@ -19,6 +25,11 @@ from pymammotion.transport.base import (
 from pymammotion.transport.mqtt import MQTTTransport
 from pymammotion.utility.constant.device_constant import WorkMode
 
+from .report_policy import (
+    report_policy_state_from_device,
+    report_transition_rejection_reason,
+)
+
 _SEND_MARKED_PATCH_ATTR = "_mammotion_ha_cloud_safe_send_marked"
 _START_REPORT_STREAM_PATCH_ATTR = "_mammotion_ha_job_watch_report_stream"
 _MQTT_REALTIME_TOPICS_PATCH_ATTR = "_mammotion_ha_mqtt_realtime_topics_patch"
@@ -28,6 +39,8 @@ _RECORD_SEND_PATCH_ATTR = "_mammotion_ha_record_send_patch"
 _MQTT_SEND_PATCH_ATTR = "_mammotion_ha_mqtt_send_patch"
 _INVOKE_REFRESH_PATCH_ATTR = "_mammotion_ha_invoke_refresh_patch"
 _MQTT_CREDS_PATCH_ATTR = "_mammotion_ha_mqtt_creds_patch"
+_REPORT_PARTIAL_MERGE_PATCH_ATTR = "_mammotion_ha_report_partial_merge_patch"
+_REPORT_SANITY_PATCH_ATTR = "_mammotion_ha_report_sanity_patch"
 _INVOKE_REFRESH_COOLDOWN = 30.0
 _PATCH_WARNING_LOG_INTERVAL = 900.0
 _LOGGER = logging.getLogger(__name__)
@@ -39,6 +52,8 @@ _original_mqtt_dispatch = MQTTTransport._dispatch  # noqa: SLF001
 _original_mqtt_send = MQTTTransport.send
 _original_force_refresh_invoke_token = TokenManager.force_refresh_invoke_token
 _original_refresh_mqtt_creds = TokenManager.refresh_mqtt_creds
+_original_report_data_update = ReportData.update
+_original_mower_state_apply = MowerStateReducer.apply
 
 
 def _patch_warning_allowed(key: str) -> bool:
@@ -211,6 +226,89 @@ def apply_pymammotion_patches() -> None:
     ):
         setattr(TokenManager, "refresh_mqtt_creds", _refresh_mqtt_creds_require_result)
         setattr(TokenManager, _MQTT_CREDS_PATCH_ATTR, True)
+
+    if not getattr(ReportData, _REPORT_PARTIAL_MERGE_PATCH_ATTR, False):
+        setattr(ReportData, "update", _report_data_update_preserve_partial_state)
+        setattr(ReportData, _REPORT_PARTIAL_MERGE_PATCH_ATTR, True)
+
+    if not getattr(MowerStateReducer, _REPORT_SANITY_PATCH_ATTR, False):
+        setattr(MowerStateReducer, "apply", _mower_state_apply_with_report_sanity)
+        setattr(MowerStateReducer, _REPORT_SANITY_PATCH_ATTR, True)
+
+
+def _report_data_update_preserve_partial_state(
+    self: ReportData, data: Any
+) -> None:
+    """Update report data without letting partial dev/connect reports reset state."""
+    previous_dev = deepcopy(self.dev) if data.dev is not None else None
+    previous_connect = deepcopy(self.connect) if data.connect is not None else None
+
+    _original_report_data_update(self, data)
+
+    if previous_dev is not None:
+        self.dev = _merge_model_update(previous_dev, data.dev)
+    if previous_connect is not None:
+        self.connect = _merge_model_update(previous_connect, data.connect)
+
+
+def _merge_model_update(current: Any, proto_update: Any) -> Any:
+    """Merge non-default proto fields into an existing dataclass model."""
+    incoming = proto_update.to_dict(casing=betterproto2.Casing.SNAKE)
+    if not incoming:
+        return current
+
+    merged = current.to_dict()
+    _deep_update(merged, incoming)
+    return type(current).from_dict(merged)
+
+
+def _deep_update(target: dict[str, Any], updates: dict[str, Any]) -> None:
+    """Recursively merge update values into a dict model."""
+    for key, value in updates.items():
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            _deep_update(target[key], value)
+        else:
+            target[key] = value
+
+
+def _mower_state_apply_with_report_sanity(
+    self: MowerStateReducer, current: Any, message: Any
+) -> Any:
+    """Apply mower state while rejecting implausible stale report snapshots."""
+    updated = _original_mower_state_apply(self, current, message)
+    if not _message_updates_report_data(message):
+        return updated
+
+    now = time.monotonic()
+    last_accepted_at = getattr(self, "_mammotion_ha_last_report_accept_at", 0.0)
+    if last_accepted_at:
+        reason = report_transition_rejection_reason(
+            report_policy_state_from_device(current),
+            report_policy_state_from_device(updated),
+            elapsed=timedelta(seconds=now - last_accepted_at),
+        )
+        if reason is not None:
+            _log_patch_warning(
+                "report-sanity",
+                "pymammotion report reducer rejected stale-looking report: %s",
+                reason,
+            )
+            return current
+
+    setattr(self, "_mammotion_ha_last_report_accept_at", now)
+    return updated
+
+
+def _message_updates_report_data(message: Any) -> bool:
+    """Return True when a Luba message carries mower report data."""
+    try:
+        if betterproto2.which_one_of(message, "LubaSubMsg")[0] != "sys":
+            return False
+        return betterproto2.which_one_of(message.sys, "SubSysMsg")[0] == (
+            "toapp_report_data"
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
 
 
 def _register_device_with_realtime_topics(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -120,7 +121,6 @@ def test_pause_away_from_dock_only_streams_during_grace() -> None:
     [
         make_state(charge_state=1),
         make_state(battery_val=100),
-        make_state(last_status=int(policy.WorkMode.MODE_RETURNING)),
         make_state(charge_state=None, battery_val=100),
     ],
 )
@@ -133,6 +133,63 @@ def test_docked_states_use_slow_docked_cadence(state: Any) -> None:
             pause_watch_active=False,
         )
         == policy.CLOUD_REPORT_DOCKED_INTERVAL
+    )
+
+
+def test_last_returning_without_charge_is_not_docked() -> None:
+    """A stale last_status returning flag alone must not mean docked."""
+    state = make_state(last_status=int(policy.WorkMode.MODE_RETURNING))
+
+    assert not policy.is_docked_report_state(state)
+    assert (
+        policy.cloud_report_interval(
+            state,
+            continuous_watch_active=False,
+            pause_watch_active=False,
+        )
+        == policy.CLOUD_REPORT_IDLE_INTERVAL
+    )
+
+
+def test_implausible_recent_full_battery_jump_is_rejected() -> None:
+    """A 64 -> 100 jump shortly after a field report is treated as stale."""
+    previous = make_state(battery_val=64, charge_state=0)
+    current = make_state(battery_val=100, charge_state=1)
+
+    assert policy.report_transition_rejection_reason(
+        previous,
+        current,
+        elapsed=timedelta(seconds=69),
+    )
+
+
+def test_normal_docking_without_battery_jump_is_accepted() -> None:
+    """A fresh charge_state update is still accepted when the battery is stable."""
+    previous = make_state(battery_val=64, charge_state=0)
+    current = make_state(battery_val=64, charge_state=1)
+
+    assert (
+        policy.report_transition_rejection_reason(
+            previous,
+            current,
+            elapsed=timedelta(seconds=69),
+        )
+        is None
+    )
+
+
+def test_stale_full_battery_update_is_accepted_after_sanity_window() -> None:
+    """Large battery changes are allowed when the previous report is old."""
+    previous = make_state(battery_val=64, charge_state=0)
+    current = make_state(battery_val=100, charge_state=1)
+
+    assert (
+        policy.report_transition_rejection_reason(
+            previous,
+            current,
+            elapsed=policy.REPORT_SANITY_RECENT_WINDOW + timedelta(seconds=1),
+        )
+        is None
     )
 
 
