@@ -240,6 +240,14 @@
         }
       }
     },
+    "binary_sensor": {
+      "charging": {
+        "name": "Charging"
+      },
+      "dock_access_needed": {
+        "name": "Dock access needed"
+      }
+    },
     "button": {
       "start_map_sync": {
         "name": "Sync maps"

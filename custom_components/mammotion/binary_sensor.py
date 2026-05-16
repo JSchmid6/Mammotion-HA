@@ -16,6 +16,7 @@ from pymammotion.data.model.device import MowingDevice
 from . import MammotionConfigEntry
 from .coordinator import MammotionBaseUpdateCoordinator
 from .entity import MammotionBaseEntity
+from .report_policy import needs_dock_access_watch, report_policy_state_from_device
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -33,6 +34,12 @@ BINARY_SENSORS: tuple[MammotionBinarySensorEntityDescription, ...] = (
         device_class=BinarySensorDeviceClass.BATTERY_CHARGING,
         is_on_fn=lambda mower_data: mower_data.report_data.dev.charge_state in (1, 2),
         entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    MammotionBinarySensorEntityDescription(
+        key="dock_access_needed",
+        is_on_fn=lambda mower_data: needs_dock_access_watch(
+            report_policy_state_from_device(mower_data)
+        ),
     ),
 )
 
@@ -65,7 +72,7 @@ class MammotionBinarySensorEntity(MammotionBaseEntity, BinarySensorEntity):
         """Initialize the binary sensor entity."""
         super().__init__(coordinator, entity_description.key)
         self.entity_description = entity_description
-        self._attr_translation_key = entity_description.translation_key
+        self._attr_translation_key = entity_description.key
 
     @property
     def is_on(self) -> bool | None:
