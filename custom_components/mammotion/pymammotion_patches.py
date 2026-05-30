@@ -32,6 +32,7 @@ from .report_policy import (
 
 _SEND_MARKED_PATCH_ATTR = "_mammotion_ha_cloud_safe_send_marked"
 _START_REPORT_STREAM_PATCH_ATTR = "_mammotion_ha_job_watch_report_stream"
+_FORCED_REPORT_STREAM_PATCH_ATTR = "_mammotion_ha_forced_report_stream"
 _MQTT_REALTIME_TOPICS_PATCH_ATTR = "_mammotion_ha_mqtt_realtime_topics_patch"
 _MQTT_PROTO_DISPATCH_PATCH_ATTR = "_mammotion_ha_mqtt_proto_dispatch_patch"
 _TRANSPORT_AUTH_PATCH_ATTR = "_mammotion_ha_transport_auth_state_patch"
@@ -76,7 +77,7 @@ def _send_marked_already_cloud_safe() -> bool:
     """Return True when upstream already scopes BLE sync to BLE transports."""
     try:
         source = inspect.getsource(DeviceHandle._send_marked)  # noqa: SLF001
-    except (OSError, TypeError):
+    except OSError, TypeError:
         return False
     return "transport.transport_type is TransportType.BLE" in source
 
@@ -106,7 +107,7 @@ def _start_report_stream_allows_job_watch() -> bool:
     """Return True when upstream streams through recharge-pause job watches."""
     try:
         source = inspect.getsource(DeviceHandle.start_report_stream)
-    except (OSError, TypeError):
+    except OSError, TypeError:
         return False
     return "MODE_CHARGING_PAUSE" in source and "bp_info" in source
 
@@ -124,7 +125,7 @@ def _has_unfinished_mow_job(self: DeviceHandle) -> bool:
 
         left_time = int(work.progress) >> 16
         return left_time > 0
-    except (AttributeError, TypeError, ValueError):
+    except AttributeError, TypeError, ValueError:
         return False
 
 
@@ -135,7 +136,7 @@ def _is_recharge_pause_report_state(self: DeviceHandle) -> bool:
         if int(dev.sys_status) == int(WorkMode.MODE_CHARGING_PAUSE):
             return True
         return int(dev.charge_state) != 0 and _has_unfinished_mow_job(self)
-    except (AttributeError, TypeError, ValueError):
+    except AttributeError, TypeError, ValueError:
         return False
 
 
@@ -164,7 +165,34 @@ async def _start_report_stream_job_watch(
     except RuntimeError:
         return
     self._report_stream_timer = loop.call_later(  # noqa: SLF001
-        duration_ms / 1000, self._fire_report_stream_stop  # noqa: SLF001
+        duration_ms / 1000,
+        self._fire_report_stream_stop,  # noqa: SLF001
+    )
+
+
+async def _start_forced_report_stream(
+    self: DeviceHandle, duration_ms: int = 300_000
+) -> None:
+    """Start a report stream without trusting the currently cached device mode."""
+    already_streaming = self._report_stream_timer is not None  # noqa: SLF001
+
+    if self._report_stream_timer is not None:  # noqa: SLF001
+        self._report_stream_timer.cancel()  # noqa: SLF001
+        self._report_stream_timer = None  # noqa: SLF001
+
+    if not self._ble_stream_active:  # noqa: SLF001
+        if already_streaming:
+            await self._send_report_stream_keep()  # noqa: SLF001
+        else:
+            await self._send_report_stream_start(duration_ms)  # noqa: SLF001
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    self._report_stream_timer = loop.call_later(  # noqa: SLF001
+        duration_ms / 1000,
+        self._fire_report_stream_stop,  # noqa: SLF001
     )
 
 
@@ -180,6 +208,10 @@ def apply_pymammotion_patches() -> None:
     ):
         setattr(DeviceHandle, "start_report_stream", _start_report_stream_job_watch)
         setattr(DeviceHandle, _START_REPORT_STREAM_PATCH_ATTR, True)
+
+    if not getattr(DeviceHandle, _FORCED_REPORT_STREAM_PATCH_ATTR, False):
+        setattr(DeviceHandle, "start_forced_report_stream", _start_forced_report_stream)
+        setattr(DeviceHandle, _FORCED_REPORT_STREAM_PATCH_ATTR, True)
 
     if not getattr(MQTTTransport, _MQTT_REALTIME_TOPICS_PATCH_ATTR, False):
         setattr(MQTTTransport, "register_device", _register_device_with_realtime_topics)
@@ -236,9 +268,7 @@ def apply_pymammotion_patches() -> None:
         setattr(MowerStateReducer, _REPORT_SANITY_PATCH_ATTR, True)
 
 
-def _report_data_update_preserve_partial_state(
-    self: ReportData, data: Any
-) -> None:
+def _report_data_update_preserve_partial_state(self: ReportData, data: Any) -> None:
     """Update report data without letting partial dev/connect reports reset state."""
     previous_dev = deepcopy(self.dev) if data.dev is not None else None
     previous_connect = deepcopy(self.connect) if data.connect is not None else None
@@ -307,7 +337,7 @@ def _message_updates_report_data(message: Any) -> bool:
         return betterproto2.which_one_of(message.sys, "SubSysMsg")[0] == (
             "toapp_report_data"
         )
-    except (AttributeError, TypeError, ValueError):
+    except AttributeError, TypeError, ValueError:
         return False
 
 
@@ -335,7 +365,7 @@ def _mqtt_dispatch_proto_aware() -> bool:
     """Return True when upstream parses /sys/proto/<pk>/<dn> topics correctly."""
     try:
         source = inspect.getsource(MQTTTransport._dispatch)  # noqa: SLF001
-    except (OSError, TypeError):
+    except OSError, TypeError:
         return False
     return "is_raw_proto" in source or (
         ("is_proto_topic" in source or 'parts[2] == "proto"' in source)
@@ -383,7 +413,7 @@ def _transport_auth_state_already_present() -> bool:
         return False
     try:
         source = inspect.getsource(Transport.is_usable.fget)  # type: ignore[arg-type]
-    except (OSError, TypeError):
+    except OSError, TypeError:
         return False
     return "_auth_failed" in source
 
@@ -407,7 +437,7 @@ def _record_send_warns_once() -> bool:
     """Return True when upstream already logs the send-limit warning once."""
     try:
         source = inspect.getsource(Transport.record_send)
-    except (OSError, TypeError):
+    except OSError, TypeError:
         return False
     return "if not self.is_rate_limited" in source
 
@@ -435,7 +465,7 @@ def _mqtt_send_rate_auth_safe() -> bool:
     """Return True when upstream MQTT send has both rate and auth-failure guards."""
     try:
         source = inspect.getsource(MQTTTransport.send)
-    except (OSError, TypeError):
+    except OSError, TypeError:
         return False
     return "if self.is_rate_limited" in source and "mark_auth_failed" in source
 
@@ -481,7 +511,7 @@ def _invoke_refresh_has_cooldown() -> bool:
     """Return True when upstream already rate-limits invoke-token refresh failures."""
     try:
         source = inspect.getsource(TokenManager.force_refresh_invoke_token)
-    except (OSError, TypeError):
+    except OSError, TypeError:
         return False
     return "_invoke_refresh_failed_at" in source
 
@@ -515,7 +545,7 @@ def _refresh_mqtt_creds_rejects_none() -> bool:
     """Return True when upstream raises if MQTT credential refresh returns None."""
     try:
         source = inspect.getsource(TokenManager.refresh_mqtt_creds)
-    except (OSError, TypeError):
+    except OSError, TypeError:
         return False
     return "MQTT credentials not set after refresh" in source
 

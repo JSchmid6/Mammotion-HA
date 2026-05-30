@@ -96,6 +96,7 @@ from .report_policy import (
     CLOUD_REPORT_JOB_WATCH_DURATION,
     CLOUD_REPORT_PAUSE_GRACE,
     CLOUD_REPORT_SEND_RESERVE,
+    CLOUD_REPORT_STREAM_DURATION,
     CLOUD_REPORT_STREAM_DURATION_MS,
     CLOUD_REPORT_STREAM_RENEW_INTERVAL,
     CLOUD_REPORT_STREAM_STATES,
@@ -165,7 +166,7 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
             _user_account = int(
                 _mammotion_data["data"]["userInformation"]["userAccount"]
             )
-        except (KeyError, TypeError, ValueError):
+        except KeyError, TypeError, ValueError:
             _user_account = 0
         self.commands = MammotionCommand(device.device_name, _user_account)
         self._subscriptions: list[Subscription] = []
@@ -593,8 +594,7 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
         except GatewayTimeoutException as ex:
             self._log_command_warning(
                 "gateway-timeout",
-                "Mammotion cloud command for %s timed out at the gateway "
-                "(iot_id=%s)",
+                "Mammotion cloud command for %s timed out at the gateway (iot_id=%s)",
                 self.device_name,
                 getattr(ex, "iot_id", iot_id),
             )
@@ -921,7 +921,8 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
 
     async def async_leave_dock(self) -> None:
         """Leave dock."""
-        await self.send_command_and_update("leave_dock", "todev_taskctrl_ack")
+        await self.async_send_and_wait("leave_dock", "todev_taskctrl_ack")
+        await self.async_start_command_report_watch("leave_dock")
 
     async def async_cancel_task(self) -> None:
         """Cancel task."""
@@ -1057,6 +1058,9 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
         """Start a transient continuous report window via the library."""
         await self.manager.start_report_stream(self.device_name, duration_ms)
 
+    async def async_start_command_report_watch(self, reason: str) -> None:
+        """Start post-command report watching when supported by the coordinator."""
+
     async def async_get_reports(self, count: int = 5) -> None:
         """Get reports from the device."""
         await self.manager.request_reports(self.device_name, count=count)
@@ -1163,6 +1167,7 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
         await self.async_send_and_wait(
             "single_schedule", "todev_planjob_set", plan_id=plan_id
         )
+        await self.async_start_command_report_watch("single_schedule")
 
     async def async_restart_mower(self) -> None:
         """Restart mower."""
@@ -1426,6 +1431,7 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         self._job_watch_until = 0.0
         self._pause_watch_until = 0.0
         self._dock_access_watch_until = 0.0
+        self._command_report_watch_until = 0.0
         self._last_report_sys_status: int | None = None
         self._pause_stream_stop_unsub: CALLBACK_TYPE | None = None
         self._dock_access_poll_unsub: CALLBACK_TYPE | None = None
@@ -1525,6 +1531,25 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         """Get coordinator data."""
         return device
 
+    async def async_start_command_report_watch(self, reason: str) -> None:
+        """Watch for real report updates after a command-driven transition."""
+        self._command_report_watch_until = max(
+            self._command_report_watch_until,
+            time.monotonic() + CLOUD_REPORT_STREAM_DURATION.total_seconds(),
+        )
+        LOGGER.debug(
+            "report-coordinator [%s]: command report watch armed for %s",
+            self.device_name,
+            reason,
+        )
+        if not await self._async_ensure_active_report_stream(reason=reason):
+            LOGGER.debug(
+                "report-coordinator [%s]: command report watch for %s could not "
+                "start a report stream",
+                self.device_name,
+                reason,
+            )
+
     def _has_usable_ble_transport(self) -> bool:
         """Return True when BLE can provide fresher local report data."""
         if not self._bluetooth_enabled:
@@ -1558,7 +1583,9 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
 
             transport_limit = getattr(transport, "_SEND_LIMIT", None)
             if isinstance(transport_limit, int):
-                limit = transport_limit if limit is None else min(limit, transport_limit)
+                limit = (
+                    transport_limit if limit is None else min(limit, transport_limit)
+                )
 
             rate_limited = rate_limited or bool(
                 getattr(transport, "is_rate_limited", False)
@@ -1578,6 +1605,10 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         """Return True while an observed mowing job is still worth watching."""
         return time.monotonic() < self._job_watch_until
 
+    def _command_report_watch_active(self) -> bool:
+        """Return True while a command-triggered transition should be watched."""
+        return time.monotonic() < self._command_report_watch_until
+
     def _pause_report_watch_active(self) -> bool:
         """Return True during the short grace window after a pause transition."""
         return time.monotonic() < self._pause_watch_until
@@ -1588,6 +1619,8 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
 
     def _needs_continuous_report_stream(self, device: MowingDevice) -> bool:
         """Return True when state changes need report-stream freshness."""
+        if self._command_report_watch_active():
+            return True
         return needs_continuous_report_stream(
             report_policy_state_from_device(device),
             continuous_watch_active=self._continuous_report_watch_active(),
@@ -1644,6 +1677,7 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         sys_status = self._safe_sys_status(device)
         state = report_policy_state_from_device(device)
         if is_active_report_state(state) or is_recharge_pause_state(state):
+            self._command_report_watch_until = 0.0
             self._job_watch_until = max(
                 self._job_watch_until,
                 now + CLOUD_REPORT_JOB_WATCH_DURATION.total_seconds(),
@@ -1680,7 +1714,7 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         """Return sys_status as int when available."""
         try:
             return int(device.report_data.dev.sys_status)
-        except (AttributeError, TypeError, ValueError):
+        except AttributeError, TypeError, ValueError:
             return None
 
     def _cancel_pause_stream_stop(self) -> None:
@@ -1905,7 +1939,13 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
 
         self._cloud_stream_requesting = True
         try:
-            await self.async_start_report_stream(CLOUD_REPORT_STREAM_DURATION_MS)
+            if self._command_report_watch_active():
+                if not await self._async_start_forced_report_stream(
+                    CLOUD_REPORT_STREAM_DURATION_MS
+                ):
+                    return False
+            else:
+                await self.async_start_report_stream(CLOUD_REPORT_STREAM_DURATION_MS)
         except (
             DeviceOfflineException,
             NoTransportAvailableError,
@@ -1923,6 +1963,18 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
             self.device_name,
             reason,
         )
+        return True
+
+    async def _async_start_forced_report_stream(self, duration_ms: int) -> bool:
+        """Start a cloud report stream for a command transition from stale state."""
+        handle = self.manager.mower(self.device_name)
+        if handle is None:
+            return False
+        start_forced = getattr(handle, "start_forced_report_stream", None)
+        if start_forced is None:
+            await self.async_start_report_stream(duration_ms)
+            return True
+        await start_forced(duration_ms)
         return True
 
     async def _async_request_report_snapshot_guarded(
@@ -2085,9 +2137,7 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
 
     async def _async_setup(self) -> None:
         await super()._async_setup()
-        await self._async_request_report_snapshot_guarded(
-            priority=True, reason="setup"
-        )
+        await self._async_request_report_snapshot_guarded(priority=True, reason="setup")
 
         try:
             await self.async_read_rain_detection()
@@ -2128,7 +2178,7 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
             stream_candidate = int(sys_status) in CLOUD_REPORT_STREAM_STATES or int(
                 sys_status
             ) == int(WorkMode.MODE_PAUSE)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             stream_candidate = False
 
         if stream_candidate and await self._async_ensure_active_report_stream(
@@ -2182,7 +2232,7 @@ class MammotionMaintenanceUpdateCoordinator(MammotionBaseUpdateCoordinator[Maint
         if was_working and sys_status == WorkMode.MODE_READY:
             try:
                 await self.async_send_command("get_maintenance")
-            except (DeviceOfflineException, GatewayTimeoutException):
+            except DeviceOfflineException, GatewayTimeoutException:
                 pass
 
     async def _async_update_data(self) -> Maintain:
@@ -2209,7 +2259,7 @@ class MammotionMaintenanceUpdateCoordinator(MammotionBaseUpdateCoordinator[Maint
             await self.async_send_and_wait(
                 "read_job_do_not_disturb", "todev_unable_time_set"
             )
-        except (DeviceOfflineException, GatewayTimeoutException):
+        except DeviceOfflineException, GatewayTimeoutException:
             pass
 
 
@@ -2413,7 +2463,7 @@ class MammotionMapUpdateCoordinator(MammotionBaseUpdateCoordinator[MowerInfo]):
                 return device.mower_state
         except GatewayTimeoutException:
             pass
-        except (ConcurrentRequestError, NoTransportAvailableError):
+        except ConcurrentRequestError, NoTransportAvailableError:
             pass
 
         _d = self.manager.get_device_by_name(self.device_name)
@@ -2697,7 +2747,7 @@ class MammotionRTKCoordinator(MammotionBaseUpdateCoordinator[RTKBaseStationDevic
                                 self.data.update_check = check_version
                 except ReLoginRequiredError:
                     await self.async_refresh_login()
-                except (DeviceOfflineException, GatewayTimeoutException):
+                except DeviceOfflineException, GatewayTimeoutException:
                     pass
 
         return self.data
