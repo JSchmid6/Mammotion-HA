@@ -232,7 +232,7 @@ class MammotionLawnMowerEntity(MammotionBaseEntity, LawnMowerEntity):  # type: i
         try:
             if int(status.charge_state) != 0:
                 return True
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             pass
 
         return False
@@ -274,6 +274,7 @@ class MammotionLawnMowerEntity(MammotionBaseEntity, LawnMowerEntity):  # type: i
         #
         mode = self.rpt_dev_status.sys_status
         breakpoint_info = self.report_data.work.bp_info
+        command_watch_started = False
         if mode is None:
             raise HomeAssistantError(
                 translation_domain=DOMAIN, translation_key="device_not_ready"
@@ -305,6 +306,10 @@ class MammotionLawnMowerEntity(MammotionBaseEntity, LawnMowerEntity):  # type: i
                     trans_key = "resume_failed"
                     if breakpoint_info != 0:
                         await self.coordinator.async_send_command("resume_execute_task")
+                        await self.coordinator.async_start_command_report_watch(
+                            "resume_execute_task"
+                        )
+                        command_watch_started = True
                         await self.coordinator.async_send_and_wait(
                             "query_generate_route_information", "bidire_reqconver_path"
                         )
@@ -316,19 +321,28 @@ class MammotionLawnMowerEntity(MammotionBaseEntity, LawnMowerEntity):  # type: i
                         )
                         if not plan_only:
                             await self.coordinator.async_send_command("start_job")
+                            await self.coordinator.async_start_command_report_watch(
+                                "start_job"
+                            )
+                            command_watch_started = True
                         return
                     if await self.coordinator.async_plan_route(operational_settings):
                         if not plan_only:
                             await self.coordinator.async_send_and_wait(
                                 "start_job", "zone_start_precent_t"
                             )
+                            await self.coordinator.async_start_command_report_watch(
+                                "start_job"
+                            )
+                            command_watch_started = True
 
             except COMMAND_EXCEPTIONS as exc:
                 raise HomeAssistantError(
                     translation_domain=DOMAIN, translation_key=trans_key
                 ) from exc
             finally:
-                await self.coordinator.async_request_report_snapshot()
+                if not command_watch_started:
+                    await self.coordinator.async_request_report_snapshot()
 
     async def async_dock(self) -> None:
         """Start docking."""
