@@ -255,6 +255,56 @@ def test_stale_full_battery_update_is_accepted_after_sanity_window() -> None:
     )
 
 
+def test_stale_pause_after_docked_ready_is_rejected_without_time_window() -> None:
+    """A docked mower should not resurrect an old paused job snapshot later."""
+    previous = make_state(
+        sys_status=int(policy.WorkMode.MODE_READY),
+        charge_state=1,
+        battery_val=100,
+    )
+    current = make_state(
+        sys_status=int(policy.WorkMode.MODE_PAUSE),
+        charge_state=1,
+        battery_val=64,
+        work_area=encoded_high_word(89) | 133,
+        work_progress=encoded_high_word(7) | 96,
+    )
+
+    reason = policy.report_transition_rejection_reason(
+        previous,
+        current,
+        elapsed=timedelta(hours=1),
+    )
+
+    assert reason is not None
+    assert "stale pause" in reason
+
+
+def test_pause_after_active_report_is_accepted_with_stale_charge_state() -> None:
+    """A real active-to-pause transition remains valid even if charge_state is stale."""
+    previous = make_state(
+        sys_status=int(policy.WorkMode.MODE_WORKING),
+        charge_state=1,
+        battery_val=70,
+    )
+    current = make_state(
+        sys_status=int(policy.WorkMode.MODE_PAUSE),
+        charge_state=1,
+        battery_val=69,
+        work_area=encoded_high_word(89) | 133,
+        work_progress=encoded_high_word(7) | 96,
+    )
+
+    assert (
+        policy.report_transition_rejection_reason(
+            previous,
+            current,
+            elapsed=timedelta(hours=1),
+        )
+        is None
+    )
+
+
 def test_field_error_uses_minimal_keepalive() -> None:
     """A mower stopped with an error away from charging gets the minimal keepalive."""
     state = make_state(sys_status=int(policy.WorkMode.MODE_LOCK), charge_state=0)
