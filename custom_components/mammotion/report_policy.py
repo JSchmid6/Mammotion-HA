@@ -44,6 +44,14 @@ CLOUD_REPORT_ERROR_STATES = frozenset(
         int(WorkMode.MODE_BOUNDARY_JUMP),
     }
 )
+PAUSE_REPORT_SOURCE_STATES = frozenset(
+    {
+        int(WorkMode.MODE_WORKING),
+        int(WorkMode.MODE_RETURNING),
+        int(WorkMode.MODE_CHARGING_PAUSE),
+        int(WorkMode.MODE_PAUSE),
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +187,12 @@ def report_transition_rejection_reason(
     elapsed: timedelta,
 ) -> str | None:
     """Return why a report transition is implausible, or None when accepted."""
+    if is_stale_docked_pause_transition(previous, current):
+        return (
+            "stale pause report after docked status "
+            f"{previous.sys_status}->{current.sys_status}"
+        )
+
     if elapsed > REPORT_SANITY_RECENT_WINDOW:
         return None
     if previous.battery_val is None or current.battery_val is None:
@@ -195,6 +209,20 @@ def report_transition_rejection_reason(
         "implausible recent battery jump "
         f"{previous.battery_val}->{current.battery_val} in {elapsed}"
     )
+
+
+def is_stale_docked_pause_transition(
+    previous: ReportPolicyState,
+    current: ReportPolicyState,
+) -> bool:
+    """Return True when a docked report is followed by an old pause snapshot."""
+    if current.sys_status != int(WorkMode.MODE_PAUSE):
+        return False
+    if previous.sys_status in PAUSE_REPORT_SOURCE_STATES:
+        return False
+    if not is_docked_report_state(previous):
+        return False
+    return has_unfinished_mow_job(current)
 
 
 def is_field_error_state(state: ReportPolicyState) -> bool:
