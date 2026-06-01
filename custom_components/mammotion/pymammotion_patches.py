@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import inspect
 import logging
 import time
@@ -42,10 +43,14 @@ _INVOKE_REFRESH_PATCH_ATTR = "_mammotion_ha_invoke_refresh_patch"
 _MQTT_CREDS_PATCH_ATTR = "_mammotion_ha_mqtt_creds_patch"
 _REPORT_PARTIAL_MERGE_PATCH_ATTR = "_mammotion_ha_report_partial_merge_patch"
 _REPORT_SANITY_PATCH_ATTR = "_mammotion_ha_report_sanity_patch"
+_RAW_MESSAGE_SOURCE_PATCH_ATTR = "_mammotion_ha_raw_message_source_patch"
 _INVOKE_REFRESH_COOLDOWN = 30.0
 _PATCH_WARNING_LOG_INTERVAL = 900.0
 _LOGGER = logging.getLogger(__name__)
 _last_patch_warning_log_at: dict[str, float] = {}
+_REPORT_SOURCE_CONTEXT: contextvars.ContextVar[dict[str, str] | None] = (
+    contextvars.ContextVar("mammotion_ha_report_source", default=None)
+)
 
 _original_register_device = MQTTTransport.register_device
 _original_start_report_stream = DeviceHandle.start_report_stream
@@ -55,6 +60,7 @@ _original_force_refresh_invoke_token = TokenManager.force_refresh_invoke_token
 _original_refresh_mqtt_creds = TokenManager.refresh_mqtt_creds
 _original_report_data_update = ReportData.update
 _original_mower_state_apply = MowerStateReducer.apply
+_original_on_raw_message = DeviceHandle.on_raw_message
 
 
 def _patch_warning_allowed(key: str) -> bool:
@@ -124,9 +130,10 @@ def _has_unfinished_mow_job(self: DeviceHandle) -> bool:
             return True
 
         left_time = int(work.progress) >> 16
-        return left_time > 0
     except AttributeError, TypeError, ValueError:
         return False
+    else:
+        return left_time > 0
 
 
 def _is_recharge_pause_report_state(self: DeviceHandle) -> bool:
@@ -198,6 +205,16 @@ async def _start_forced_report_stream(
 
 def apply_pymammotion_patches() -> None:
     """Apply pymammotion compatibility patches once."""
+    _patch_device_handle_send_and_streams()
+    _patch_mqtt_transport()
+    _patch_transport_auth_and_rate_limits()
+    _patch_token_refresh()
+    _patch_report_reducer()
+    _patch_raw_message_source()
+
+
+def _patch_device_handle_send_and_streams() -> None:
+    """Patch DeviceHandle send and report-stream behavior."""
     if not getattr(DeviceHandle, _SEND_MARKED_PATCH_ATTR, False):
         if not _send_marked_already_cloud_safe():
             setattr(DeviceHandle, "_send_marked", _send_marked_cloud_safe)
@@ -213,6 +230,9 @@ def apply_pymammotion_patches() -> None:
         setattr(DeviceHandle, "start_forced_report_stream", _start_forced_report_stream)
         setattr(DeviceHandle, _FORCED_REPORT_STREAM_PATCH_ATTR, True)
 
+
+def _patch_mqtt_transport() -> None:
+    """Patch MQTT topic registration, dispatch, and send guards."""
     if not getattr(MQTTTransport, _MQTT_REALTIME_TOPICS_PATCH_ATTR, False):
         setattr(MQTTTransport, "register_device", _register_device_with_realtime_topics)
         setattr(MQTTTransport, _MQTT_REALTIME_TOPICS_PATCH_ATTR, True)
@@ -223,6 +243,15 @@ def apply_pymammotion_patches() -> None:
         setattr(MQTTTransport, "_dispatch", _mqtt_dispatch_with_proto_routing)
         setattr(MQTTTransport, _MQTT_PROTO_DISPATCH_PATCH_ATTR, True)
 
+    if not _mqtt_send_rate_auth_safe() and not getattr(
+        MQTTTransport, _MQTT_SEND_PATCH_ATTR, False
+    ):
+        setattr(MQTTTransport, "send", _mqtt_send_with_rate_and_auth_guard)
+        setattr(MQTTTransport, _MQTT_SEND_PATCH_ATTR, True)
+
+
+def _patch_transport_auth_and_rate_limits() -> None:
+    """Patch base transport auth and rate-limit helpers."""
     if not _transport_auth_state_already_present() and not getattr(
         Transport, _TRANSPORT_AUTH_PATCH_ATTR, False
     ):
@@ -237,12 +266,9 @@ def apply_pymammotion_patches() -> None:
         setattr(Transport, "record_send", _record_send_warn_once)
         setattr(Transport, _RECORD_SEND_PATCH_ATTR, True)
 
-    if not _mqtt_send_rate_auth_safe() and not getattr(
-        MQTTTransport, _MQTT_SEND_PATCH_ATTR, False
-    ):
-        setattr(MQTTTransport, "send", _mqtt_send_with_rate_and_auth_guard)
-        setattr(MQTTTransport, _MQTT_SEND_PATCH_ATTR, True)
 
+def _patch_token_refresh() -> None:
+    """Patch token refresh edge cases."""
     if not _invoke_refresh_has_cooldown() and not getattr(
         TokenManager, _INVOKE_REFRESH_PATCH_ATTR, False
     ):
@@ -259,6 +285,9 @@ def apply_pymammotion_patches() -> None:
         setattr(TokenManager, "refresh_mqtt_creds", _refresh_mqtt_creds_require_result)
         setattr(TokenManager, _MQTT_CREDS_PATCH_ATTR, True)
 
+
+def _patch_report_reducer() -> None:
+    """Patch report merging and sanity checks."""
     if not getattr(ReportData, _REPORT_PARTIAL_MERGE_PATCH_ATTR, False):
         setattr(ReportData, "update", _report_data_update_preserve_partial_state)
         setattr(ReportData, _REPORT_PARTIAL_MERGE_PATCH_ATTR, True)
@@ -266,6 +295,32 @@ def apply_pymammotion_patches() -> None:
     if not getattr(MowerStateReducer, _REPORT_SANITY_PATCH_ATTR, False):
         setattr(MowerStateReducer, "apply", _mower_state_apply_with_report_sanity)
         setattr(MowerStateReducer, _REPORT_SANITY_PATCH_ATTR, True)
+
+
+def _patch_raw_message_source() -> None:
+    """Patch DeviceHandle so report diagnostics know the inbound transport."""
+    if not getattr(DeviceHandle, _RAW_MESSAGE_SOURCE_PATCH_ATTR, False):
+        setattr(DeviceHandle, "on_raw_message", _on_raw_message_with_source)
+        setattr(DeviceHandle, _RAW_MESSAGE_SOURCE_PATCH_ATTR, True)
+
+
+async def _on_raw_message_with_source(
+    self: DeviceHandle,
+    payload: bytes,
+    transport_type: TransportType = TransportType.CLOUD_ALIYUN,
+) -> None:
+    """Track the inbound transport while a raw device message is reduced."""
+    if _REPORT_SOURCE_CONTEXT.get() is not None:
+        await _original_on_raw_message(self, payload, transport_type)
+        return
+
+    token = _REPORT_SOURCE_CONTEXT.set(
+        {"transport": str(transport_type.value), "topic": "unknown"}
+    )
+    try:
+        await _original_on_raw_message(self, payload, transport_type)
+    finally:
+        _REPORT_SOURCE_CONTEXT.reset(token)
 
 
 def _report_data_update_preserve_partial_state(self: ReportData, data: Any) -> None:
@@ -312,16 +367,25 @@ def _mower_state_apply_with_report_sanity(
     now = time.monotonic()
     last_accepted_at = getattr(self, "_mammotion_ha_last_report_accept_at", 0.0)
     if last_accepted_at:
+        previous_state = report_policy_state_from_device(current)
+        updated_state = report_policy_state_from_device(updated)
         reason = report_transition_rejection_reason(
-            report_policy_state_from_device(current),
-            report_policy_state_from_device(updated),
+            previous_state,
+            updated_state,
             elapsed=timedelta(seconds=now - last_accepted_at),
         )
         if reason is not None:
             _log_patch_warning(
                 "report-sanity",
-                "pymammotion report reducer rejected stale-looking report: %s",
+                (
+                    "pymammotion report reducer rejected stale-looking report: "
+                    "%s; source=%s; incoming=%s; previous=%s; reduced=%s"
+                ),
                 reason,
+                _current_report_source(),
+                _incoming_report_fields(message),
+                previous_state,
+                updated_state,
             )
             return current
 
@@ -339,6 +403,28 @@ def _message_updates_report_data(message: Any) -> bool:
         )
     except AttributeError, TypeError, ValueError:
         return False
+
+
+def _incoming_report_fields(message: Any) -> dict[str, Any]:
+    """Return compact raw report fields carried by a toapp_report_data message."""
+    try:
+        report = message.sys.toapp_report_data
+    except AttributeError:
+        return {}
+
+    fields: dict[str, Any] = {}
+    if getattr(report, "dev", None) is not None:
+        fields["dev"] = report.dev.to_dict(casing=betterproto2.Casing.SNAKE)
+    if getattr(report, "work", None) is not None:
+        fields["work"] = report.work.to_dict(casing=betterproto2.Casing.SNAKE)
+    if getattr(report, "connect", None) is not None:
+        fields["connect"] = report.connect.to_dict(casing=betterproto2.Casing.SNAKE)
+    return fields
+
+
+def _current_report_source() -> dict[str, str]:
+    """Return the best known transport source for the report currently reducing."""
+    return _REPORT_SOURCE_CONTEXT.get() or {"transport": "unknown", "topic": "unknown"}
 
 
 def _register_device_with_realtime_topics(
@@ -378,6 +464,19 @@ async def _mqtt_dispatch_with_proto_routing(
     self: MQTTTransport, topic: str, raw: bytes
 ) -> None:
     """Route direct MQTT raw protobuf topics with the correct pk/dn offset."""
+    token = _REPORT_SOURCE_CONTEXT.set(
+        {"transport": str(self.transport_type.value), "topic": topic}
+    )
+    try:
+        await _mqtt_dispatch_with_proto_routing_inner(self, topic, raw)
+    finally:
+        _REPORT_SOURCE_CONTEXT.reset(token)
+
+
+async def _mqtt_dispatch_with_proto_routing_inner(
+    self: MQTTTransport, topic: str, raw: bytes
+) -> None:
+    """Route direct MQTT raw protobuf topics with source context already set."""
     is_proto_topic = topic.startswith("/sys/proto/")
     is_down_raw_topic = topic.endswith("/thing/model/down_raw")
     if not (is_proto_topic or is_down_raw_topic) or self.on_device_message is None:
