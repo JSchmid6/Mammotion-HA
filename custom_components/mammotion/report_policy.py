@@ -193,6 +193,12 @@ def report_transition_rejection_reason(
             f"{previous.sys_status}->{current.sys_status}"
         )
 
+    if is_stale_active_ready_transition(previous, current):
+        return (
+            "stale ready report after active status "
+            f"{previous.sys_status}->{current.sys_status}"
+        )
+
     if elapsed > REPORT_SANITY_RECENT_WINDOW:
         return None
     if previous.battery_val is None or current.battery_val is None:
@@ -223,6 +229,49 @@ def is_stale_docked_pause_transition(
     if not is_docked_report_state(previous):
         return False
     return has_unfinished_mow_job(current)
+
+
+def is_stale_active_ready_transition(
+    previous: ReportPolicyState,
+    current: ReportPolicyState,
+) -> bool:
+    """Return True when an active job is replaced by an old docked snapshot."""
+    if previous.sys_status != int(WorkMode.MODE_WORKING):
+        return False
+    if current.sys_status != int(WorkMode.MODE_READY):
+        return False
+    if not has_unfinished_mow_job(previous):
+        return False
+    if not has_unfinished_mow_job(current):
+        return False
+    if not is_docked_report_state(current):
+        return False
+    return job_progress_regressed(previous, current)
+
+
+def job_progress_regressed(
+    previous: ReportPolicyState,
+    current: ReportPolicyState,
+) -> bool:
+    """Return True when job fields move backwards across a status transition."""
+    previous_completion = _high_word_or_none(previous.work_area)
+    current_completion = _high_word_or_none(current.work_area)
+    if (
+        previous_completion is not None
+        and current_completion is not None
+        and 0 < previous_completion < 100
+        and current_completion < previous_completion
+    ):
+        return True
+
+    previous_left_time = _high_word_or_none(previous.work_progress)
+    current_left_time = _high_word_or_none(current.work_progress)
+    return (
+        previous_left_time is not None
+        and current_left_time is not None
+        and previous_left_time > 0
+        and current_left_time > previous_left_time
+    )
 
 
 def is_field_error_state(state: ReportPolicyState) -> bool:
@@ -268,5 +317,12 @@ def _int_or_none(value: Any) -> int | None:
     """Return value coerced to int, or None when it is unavailable."""
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
+
+
+def _high_word_or_none(value: int | None) -> int | None:
+    """Return the high word used by Mammotion packed report fields."""
+    if value is None:
+        return None
+    return value >> 16

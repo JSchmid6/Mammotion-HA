@@ -305,6 +305,87 @@ def test_pause_after_active_report_is_accepted_with_stale_charge_state() -> None
     )
 
 
+def test_stale_ready_after_active_job_is_rejected_without_time_window() -> None:
+    """An old docked-ready snapshot must not interrupt a running mow job."""
+    previous = make_state(
+        sys_status=int(policy.WorkMode.MODE_WORKING),
+        charge_state=1,
+        battery_val=90,
+        work_area=encoded_high_word(15) | 186,
+        work_progress=encoded_high_word(85) | 100,
+    )
+    current = make_state(
+        sys_status=int(policy.WorkMode.MODE_READY),
+        charge_state=1,
+        battery_val=100,
+        work_area=186,
+        work_progress=encoded_high_word(100) | 100,
+    )
+
+    reason = policy.report_transition_rejection_reason(
+        previous,
+        current,
+        elapsed=timedelta(minutes=12),
+    )
+
+    assert reason is not None
+    assert "stale ready" in reason
+
+
+def test_real_return_to_ready_after_finished_job_is_accepted() -> None:
+    """A finished returning job may become ready even when dock evidence is present."""
+    previous = make_state(
+        sys_status=int(policy.WorkMode.MODE_RETURNING),
+        charge_state=0,
+        battery_val=43,
+        work_area=encoded_high_word(100) | 186,
+        work_progress=100,
+    )
+    current = make_state(
+        sys_status=int(policy.WorkMode.MODE_READY),
+        charge_state=1,
+        battery_val=43,
+        work_area=186,
+        work_progress=0,
+    )
+
+    assert (
+        policy.report_transition_rejection_reason(
+            previous,
+            current,
+            elapsed=timedelta(minutes=12),
+        )
+        is None
+    )
+
+
+def test_active_to_ready_without_unfinished_current_job_is_accepted() -> None:
+    """A real cancellation/reset without remaining job data is not rejected."""
+    previous = make_state(
+        sys_status=int(policy.WorkMode.MODE_WORKING),
+        charge_state=0,
+        battery_val=80,
+        work_area=encoded_high_word(15) | 186,
+        work_progress=encoded_high_word(85) | 100,
+    )
+    current = make_state(
+        sys_status=int(policy.WorkMode.MODE_READY),
+        charge_state=0,
+        battery_val=80,
+        work_area=0,
+        work_progress=0,
+    )
+
+    assert (
+        policy.report_transition_rejection_reason(
+            previous,
+            current,
+            elapsed=timedelta(minutes=12),
+        )
+        is None
+    )
+
+
 def test_field_error_uses_minimal_keepalive() -> None:
     """A mower stopped with an error away from charging gets the minimal keepalive."""
     state = make_state(sys_status=int(policy.WorkMode.MODE_LOCK), charge_state=0)
