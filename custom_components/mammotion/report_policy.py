@@ -11,9 +11,11 @@ from pymammotion.utility.constant import WorkMode
 CLOUD_REPORT_ACTIVE_INTERVAL = timedelta(seconds=30)
 CLOUD_REPORT_IDLE_INTERVAL = timedelta(minutes=15)
 CLOUD_REPORT_FIELD_ERROR_INTERVAL = timedelta(minutes=10)
-CLOUD_REPORT_DOCKED_INTERVAL = timedelta(minutes=60)
+CLOUD_REPORT_DOCKED_INTERVAL = timedelta(minutes=15)
 CLOUD_REPORT_DOCK_ACCESS_INTERVAL = timedelta(seconds=15)
 CLOUD_REPORT_TRANSITION_INTERVAL = timedelta(seconds=15)
+REPORT_FRESHNESS_MIN_AGE = timedelta(minutes=5)
+REPORT_FRESHNESS_MISSED_POLLS = 2
 CLOUD_REPORT_SEND_RESERVE = 40
 CLOUD_REPORT_CRITICAL_SEND_RESERVE = 10
 CLOUD_REPORT_BUDGET_LOG_INTERVAL = 3600.0
@@ -110,6 +112,12 @@ def cloud_report_interval(
         return CLOUD_REPORT_DOCKED_INTERVAL
 
     return CLOUD_REPORT_IDLE_INTERVAL
+
+
+def report_stale_after(interval: timedelta) -> timedelta:
+    """Return the report age after which cached state is no longer trustworthy."""
+    missed_poll_window = interval * REPORT_FRESHNESS_MISSED_POLLS
+    return max(REPORT_FRESHNESS_MIN_AGE, missed_poll_window)
 
 
 def needs_continuous_report_stream(

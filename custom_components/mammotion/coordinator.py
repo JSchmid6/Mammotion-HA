@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import dataclasses
 import datetime
 import json
 import time
@@ -106,9 +108,10 @@ from .report_policy import (
     is_active_report_state,
     is_pause_report_state,
     is_recharge_pause_state,
-    needs_dock_access_watch,
     needs_continuous_report_stream,
+    needs_dock_access_watch,
     report_policy_state_from_device,
+    report_stale_after,
     report_transition_rejection_reason,
 )
 
@@ -122,6 +125,24 @@ DEVICE_VERSION_INTERVAL = timedelta(weeks=1)
 MAP_INTERVAL = timedelta(minutes=60)
 RTK_INTERVAL = timedelta(hours=5)
 COMMAND_WARNING_LOG_INTERVAL = 900.0
+SEND_AND_WAIT_EXCEPTIONS = (
+    *EXPIRED_CREDENTIAL_EXCEPTIONS,
+    DeviceOfflineException,
+    TooManyRequestsException,
+    TransportRateLimitedError,
+    NoTransportAvailableError,
+    GatewayTimeoutException,
+    CommandTimeoutError,
+    ConcurrentRequestError,
+)
+
+
+def _int_or_none(value: Any) -> int | None:
+    """Return value coerced to int, or None when unavailable."""
+    try:
+        return int(value)
+    except TypeError, ValueError:
+        return None
 
 
 class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # type: ignore[misc]
@@ -156,6 +177,7 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
         self._operation_settings = OperationSettings()
         self.update_failures = 0
         self._last_command_warning_log_at: dict[str, float] = {}
+        self._last_stale_availability_log_at = 0.0
         self._stream_data: Response[StreamSubscriptionResponse] | None = (
             None  # Stream data [Agora]
         )
@@ -301,12 +323,18 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
         handle = self.manager.mower(self.device_name)
         if handle is None:
             return bool(device.online)
-        if handle.has_transport(TransportType.BLE) and (
-            ble := handle.get_transport(TransportType.BLE)
-        ):
-            if ble.is_usable:
-                return True
-        return bool(not handle.availability.mqtt_reported_offline)
+        return bool(handle.availability.is_available)
+
+    def is_entity_available(self) -> bool:
+        """Return True when HA entities should be shown as available."""
+        return self.is_online()
+
+    def _command_failed_error(self) -> HomeAssistantError:
+        """Build the standard command failure error for service callers."""
+        return HomeAssistantError(
+            translation_domain=DOMAIN,
+            translation_key="command_failed",
+        )
 
     def _log_command_warning(self, key: str, message: str, *args: Any) -> None:
         """Log recurring command transport warnings without flooding the log."""
@@ -395,8 +423,13 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
         self,
         command: str,
         expected_field: str,
+        *,
+        raise_on_failure: bool = False,
+        require_fresh_report: bool = False,
+        fresh_report_max_age: float = 120.0,
+        fresh_report_timeout: float = 10.0,
         **kwargs: Any,
-    ) -> None:
+    ) -> Any:
         """Send a command and wait for response with standard exception handling.
 
         Handles credential expiry, gateway/transport timeouts, and device-offline
@@ -404,21 +437,68 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
         device offline so callers can bail out of their update loops.
         """
         device = self.manager.get_device_by_name(self.device_name)
-        if device is None or not self.is_online():
-            return
+        if device is None:
+            if raise_on_failure:
+                raise self._command_failed_error()
+            return None
+        if not self.is_online():
+            self._log_command_warning(
+                "offline-preflight",
+                "Mammotion command '%s' for %s skipped because no active "
+                "transport is available",
+                command,
+                self.device_name,
+            )
+            if raise_on_failure:
+                raise self._command_failed_error()
+            return None
+        if require_fresh_report and not await self.async_wait_for_fresh_report(
+            max_age=fresh_report_max_age,
+            timeout=fresh_report_timeout,
+        ):
+            self._log_command_warning(
+                "stale-report",
+                "Mammotion command '%s' for %s skipped because the last mower "
+                "report is stale or missing",
+                command,
+                self.device_name,
+            )
+            if raise_on_failure:
+                raise self._command_failed_error()
+            return None
 
         try:
-            await self.manager.send_command_and_wait(
+            response = await self.manager.send_command_and_wait(
                 self.device_name,
                 command,
                 expected_field,
                 prefer_ble=self._bluetooth_enabled,
                 **kwargs,
             )
-        except EXPIRED_CREDENTIAL_EXCEPTIONS as exc:
+        except SEND_AND_WAIT_EXCEPTIONS as exc:
+            await self._async_handle_send_and_wait_exception(
+                command,
+                exc,
+                raise_on_failure=raise_on_failure,
+            )
+            return None
+        self._raise_for_command_result(command, expected_field, response)
+        self.update_failures = 0
+        return response
+
+    async def _async_handle_send_and_wait_exception(
+        self,
+        command: str,
+        exc: Exception,
+        *,
+        raise_on_failure: bool,
+    ) -> None:
+        """Handle send-and-wait exceptions with consistent logging and errors."""
+        if isinstance(exc, EXPIRED_CREDENTIAL_EXCEPTIONS):
             self.update_failures += 1
             await self.async_refresh_login(exc)
-        except DeviceOfflineException:
+            return
+        if isinstance(exc, DeviceOfflineException):
             device = self.manager.get_device_by_name(self.device_name)
             if device is not None:
                 self.device_offline(device)
@@ -428,7 +508,7 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
                 command,
                 self.device_name,
             )
-        except (TooManyRequestsException, TransportRateLimitedError) as exc:
+        elif isinstance(exc, (TooManyRequestsException, TransportRateLimitedError)):
             self._log_command_warning(
                 "rate-limit",
                 "Mammotion command '%s' for %s blocked by rate limiting: %s",
@@ -439,7 +519,7 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
             raise HomeAssistantError(
                 translation_domain=DOMAIN, translation_key="api_limit_exceeded"
             ) from exc
-        except NoTransportAvailableError as exc:
+        elif isinstance(exc, NoTransportAvailableError):
             self._log_command_warning(
                 "no-transport",
                 "Mammotion command '%s' for %s failed because no transport "
@@ -447,10 +527,8 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
                 command,
                 self.device_name,
             )
-            raise HomeAssistantError(
-                translation_domain=DOMAIN, translation_key="command_failed"
-            ) from exc
-        except GatewayTimeoutException as exc:
+            raise self._command_failed_error() from exc
+        elif isinstance(exc, GatewayTimeoutException):
             self._log_command_warning(
                 "gateway-timeout",
                 "Mammotion command '%s' for %s timed out at the cloud gateway: %s",
@@ -458,7 +536,7 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
                 self.device_name,
                 exc,
             )
-        except CommandTimeoutError as exc:
+        elif isinstance(exc, CommandTimeoutError):
             self._log_command_warning(
                 "command-timeout",
                 "Mammotion command '%s' for %s timed out waiting for device "
@@ -467,13 +545,105 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
                 self.device_name,
                 exc,
             )
-        except ConcurrentRequestError:
+        elif isinstance(exc, ConcurrentRequestError):
             LOGGER.debug(
                 "Mammotion command '%s' for %s skipped because another "
                 "request is active",
                 command,
                 self.device_name,
             )
+        if raise_on_failure:
+            raise self._command_failed_error() from exc
+        return None
+
+    async def async_wait_for_fresh_report(
+        self,
+        *,
+        max_age: float,
+        timeout: float,
+    ) -> bool:
+        """Request a report and wait until cached mower state is fresh enough."""
+        if self.has_fresh_report(max_age=max_age):
+            return True
+
+        handle = self.manager.mower(self.device_name)
+        if handle is None:
+            return False
+        report_before = getattr(handle, "last_report_at", 0.0)
+        try:
+            await self.async_request_report_snapshot()
+        except (
+            DeviceOfflineException,
+            NoTransportAvailableError,
+            TransportRateLimitedError,
+            TooManyRequestsException,
+        ) as exc:
+            self._log_command_warning(
+                "fresh-report",
+                "Mammotion fresh-report request for %s failed: %s",
+                self.device_name,
+                exc,
+            )
+            return False
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.has_fresh_report(max_age=max_age) and (
+                not report_before
+                or getattr(handle, "last_report_at", 0.0) > report_before
+            ):
+                return True
+            await asyncio.sleep(0.25)
+
+        return self.has_fresh_report(max_age=max_age)
+
+    def has_fresh_report(self, *, max_age: float) -> bool:
+        """Return True when the last raw mower report is recent enough."""
+        handle = self.manager.mower(self.device_name)
+        if handle is None:
+            return False
+        last_report_at = getattr(handle, "last_report_at", 0.0)
+        return bool(last_report_at and time.monotonic() - last_report_at <= max_age)
+
+    def _raise_for_command_result(
+        self,
+        command: str,
+        expected_field: str,
+        response: Any,
+    ) -> None:
+        """Raise if a matched command response carries a non-zero result code."""
+        payload = self._find_response_field(response, expected_field)
+        result = _int_or_none(getattr(payload, "result", None))
+        if result in (None, 0):
+            return
+        self._log_command_warning(
+            f"result-{command}",
+            "Mammotion command '%s' for %s returned result=%s in %s",
+            command,
+            self.device_name,
+            result,
+            expected_field,
+        )
+        raise HomeAssistantError(
+            translation_domain=DOMAIN,
+            translation_key="command_failed",
+        )
+
+    def _find_response_field(self, value: Any, field_name: str) -> Any:
+        """Find a nested protobuf/dataclass field by name."""
+        if value is None:
+            return None
+        if hasattr(value, field_name):
+            candidate = getattr(value, field_name)
+            if candidate is not None:
+                return candidate
+        if dataclasses.is_dataclass(value):
+            for field in dataclasses.fields(value):
+                candidate = self._find_response_field(
+                    getattr(value, field.name), field_name
+                )
+                if candidate is not None:
+                    return candidate
+        return None
 
     @staticmethod
     def device_offline(device: MowingDevice | RTKBaseStationDevice) -> None:
@@ -921,7 +1091,12 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
 
     async def async_leave_dock(self) -> None:
         """Leave dock."""
-        await self.async_send_and_wait("leave_dock", "todev_taskctrl_ack")
+        await self.async_send_and_wait(
+            "leave_dock",
+            "todev_taskctrl_ack",
+            raise_on_failure=True,
+            require_fresh_report=True,
+        )
         await self.async_start_command_report_watch("leave_dock")
 
     async def async_cancel_task(self) -> None:
@@ -1165,7 +1340,11 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
     async def start_task(self, plan_id: str) -> None:
         """Start task."""
         await self.async_send_and_wait(
-            "single_schedule", "todev_planjob_set", plan_id=plan_id
+            "single_schedule",
+            "todev_planjob_set",
+            plan_id=plan_id,
+            raise_on_failure=True,
+            require_fresh_report=True,
         )
         await self.async_start_command_report_watch("single_schedule")
 
@@ -1530,6 +1709,30 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
     def get_coordinator_data(self, device: MowingDevice) -> MowingDevice:
         """Get coordinator data."""
         return device
+
+    def is_entity_available(self) -> bool:
+        """Return True when mower reports are recent enough for HA state."""
+        if not super().is_entity_available():
+            return False
+        stale_after = self._report_stale_after().total_seconds()
+        if self.has_fresh_report(max_age=stale_after):
+            return True
+        now = time.monotonic()
+        if (
+            now - self._last_stale_availability_log_at
+            >= CLOUD_REPORT_BUDGET_LOG_INTERVAL
+        ):
+            self._last_stale_availability_log_at = now
+            LOGGER.warning(
+                "Mammotion reports for %s are stale or missing; marking mower "
+                "entities unavailable until a fresh device report arrives",
+                self.device_name,
+            )
+        return False
+
+    def _report_stale_after(self) -> timedelta:
+        """Return the age after which cached mower state is stale."""
+        return report_stale_after(self._cloud_report_interval())
 
     async def async_start_command_report_watch(self, reason: str) -> None:
         """Watch for real report updates after a command-driven transition."""
