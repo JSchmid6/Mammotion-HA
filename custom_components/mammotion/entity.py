@@ -132,7 +132,9 @@ class MammotionBaseEntity(CoordinatorEntity[MammotionBaseUpdateCoordinator[Any]]
     @property
     def available(self) -> bool:
         """Return True if entity is available."""
-        return self.coordinator.data is not None and self.coordinator.is_online()
+        return (
+            self.coordinator.data is not None and self.coordinator.is_entity_available()
+        )
 
 
 class MammotionBaseRTKEntity(CoordinatorEntity[MammotionRTKCoordinator]):  # type: ignore[misc]
@@ -277,4 +279,6 @@ class MammotionCameraBaseEntity(Camera, ABC):  # type: ignore[misc]
     @property
     def available(self) -> bool:
         """Return True if entity is available."""
-        return self.coordinator.data is not None and self.coordinator.is_online()
+        return (
+            self.coordinator.data is not None and self.coordinator.is_entity_available()
+        )

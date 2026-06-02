@@ -198,6 +198,17 @@ def test_docked_states_use_slow_docked_cadence(state: Any) -> None:
     )
 
 
+def test_docked_cadence_is_short_enough_for_automation_freshness() -> None:
+    """Docked-full reports must not wait an hour before the next poll."""
+    assert timedelta(minutes=15) == policy.CLOUD_REPORT_DOCKED_INTERVAL
+
+
+def test_report_stale_after_allows_two_missed_polls_with_minimum() -> None:
+    """Report stale age tracks missed polls without making active states too tight."""
+    assert policy.report_stale_after(timedelta(minutes=15)) == timedelta(minutes=30)
+    assert policy.report_stale_after(timedelta(seconds=30)) == timedelta(minutes=5)
+
+
 def test_last_returning_without_charge_is_not_docked() -> None:
     """A stale last_status returning flag alone must not mean docked."""
     state = make_state(last_status=int(policy.WorkMode.MODE_RETURNING))
