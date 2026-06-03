@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import inspect
+import json
 import logging
 import time
 from copy import deepcopy
@@ -48,7 +49,7 @@ _INVOKE_REFRESH_COOLDOWN = 30.0
 _PATCH_WARNING_LOG_INTERVAL = 900.0
 _LOGGER = logging.getLogger(__name__)
 _last_patch_warning_log_at: dict[str, float] = {}
-_REPORT_SOURCE_CONTEXT: contextvars.ContextVar[dict[str, str] | None] = (
+_REPORT_SOURCE_CONTEXT: contextvars.ContextVar[dict[str, Any] | None] = (
     contextvars.ContextVar("mammotion_ha_report_source", default=None)
 )
 
@@ -388,9 +389,53 @@ def _mower_state_apply_with_report_sanity(
                 updated_state,
             )
             return current
+        _log_report_diagnostic_if_needed(previous_state, updated_state, message)
 
     setattr(self, "_mammotion_ha_last_report_accept_at", now)
     return updated
+
+
+def _log_report_diagnostic_if_needed(
+    previous: Any,
+    updated: Any,
+    message: Any,
+) -> None:
+    """Log accepted report transitions that need postmortem evidence."""
+    reason = _accepted_report_diagnostic_reason(previous, updated)
+    if reason is None:
+        return
+
+    _log_patch_warning(
+        f"report-diagnostic:{reason}:{previous.sys_status}->{updated.sys_status}",
+        (
+            "pymammotion report reducer accepted diagnostic report: "
+            "%s; envelope=%s; source=%s; incoming=%s; previous=%s; reduced=%s"
+        ),
+        reason,
+        _report_message_envelope(message),
+        _current_report_source(),
+        _incoming_report_fields(message),
+        previous,
+        updated,
+    )
+
+
+def _accepted_report_diagnostic_reason(previous: Any, updated: Any) -> str | None:
+    """Return why an accepted report should be visible in logs."""
+    if _is_active_docked_hybrid(updated):
+        return "active status with dock/charge evidence"
+    if previous.sys_status != updated.sys_status:
+        return "sys_status changed"
+    return None
+
+
+def _is_active_docked_hybrid(state: Any) -> bool:
+    """Return True when a report is both active and docked/charging."""
+    return state.sys_status in {
+        int(WorkMode.MODE_WORKING),
+        int(WorkMode.MODE_RETURNING),
+        int(WorkMode.MODE_CHARGING_PAUSE),
+    } and state.charge_state not in (None, 0)
 
 
 def _message_updates_report_data(message: Any) -> bool:
@@ -422,7 +467,50 @@ def _incoming_report_fields(message: Any) -> dict[str, Any]:
     return fields
 
 
-def _current_report_source() -> dict[str, str]:
+def _report_message_envelope(message: Any) -> dict[str, Any]:
+    """Return compact LubaMsg envelope fields for report diagnostics."""
+    envelope: dict[str, Any] = {}
+    for key in (
+        "msgtype",
+        "sender",
+        "rcver",
+        "msgattr",
+        "seqs",
+        "version",
+        "subtype",
+        "timestamp",
+    ):
+        if not hasattr(message, key):
+            continue
+        envelope[key] = _compact_log_value(getattr(message, key))
+
+    try:
+        sub_name, sub_val = betterproto2.which_one_of(message, "LubaSubMsg")
+        envelope["sub_msg"] = sub_name
+        if sub_val is not None:
+            leaf_name, _ = betterproto2.which_one_of(sub_val, "SubSysMsg")
+            envelope["sys_msg"] = leaf_name
+    except AttributeError, TypeError, ValueError:
+        pass
+    return envelope
+
+
+def _compact_log_value(value: Any) -> Any:
+    """Return a JSON-like scalar useful in diagnostic logs."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+
+    name = getattr(value, "name", None)
+    if name is not None:
+        return str(name)
+
+    try:
+        return int(value)
+    except TypeError, ValueError:
+        return str(value)
+
+
+def _current_report_source() -> dict[str, Any]:
     """Return the best known transport source for the report currently reducing."""
     return _REPORT_SOURCE_CONTEXT.get() or {"transport": "unknown", "topic": "unknown"}
 
@@ -464,13 +552,38 @@ async def _mqtt_dispatch_with_proto_routing(
     self: MQTTTransport, topic: str, raw: bytes
 ) -> None:
     """Route direct MQTT raw protobuf topics with the correct pk/dn offset."""
-    token = _REPORT_SOURCE_CONTEXT.set(
-        {"transport": str(self.transport_type.value), "topic": topic}
-    )
+    token = _REPORT_SOURCE_CONTEXT.set(_mqtt_source_context(self, topic, raw))
     try:
         await _mqtt_dispatch_with_proto_routing_inner(self, topic, raw)
     finally:
         _REPORT_SOURCE_CONTEXT.reset(token)
+
+
+def _mqtt_source_context(
+    transport: MQTTTransport,
+    topic: str,
+    raw: bytes,
+) -> dict[str, Any]:
+    """Return MQTT source metadata for report diagnostics."""
+    source: dict[str, Any] = {
+        "transport": str(transport.transport_type.value),
+        "topic": topic,
+    }
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError, UnicodeDecodeError, ValueError:
+        source["payload"] = "raw-protobuf"
+        return source
+
+    params = parsed.get("params")
+    if not isinstance(params, dict):
+        return source
+
+    for key in ("iotId", "identifier", "time"):
+        if key in params:
+            source[key] = params[key]
+    source["payload"] = "json-envelope"
+    return source
 
 
 async def _mqtt_dispatch_with_proto_routing_inner(
