@@ -125,6 +125,7 @@ DEVICE_VERSION_INTERVAL = timedelta(weeks=1)
 MAP_INTERVAL = timedelta(minutes=60)
 RTK_INTERVAL = timedelta(hours=5)
 COMMAND_WARNING_LOG_INTERVAL = 900.0
+COMMAND_REPORT_SNAPSHOT_DELAY = 10.0
 SEND_AND_WAIT_EXCEPTIONS = (
     *EXPIRED_CREDENTIAL_EXCEPTIONS,
     DeviceOfflineException,
@@ -1091,13 +1092,27 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
 
     async def async_leave_dock(self) -> None:
         """Leave dock."""
-        await self.async_send_and_wait(
-            "leave_dock",
-            "todev_taskctrl_ack",
-            raise_on_failure=True,
-            require_fresh_report=True,
-        )
+        sent = await self.async_send_command("leave_dock")
+        if sent is not True:
+            self._log_command_warning(
+                "leave-dock-not-sent",
+                "Mammotion leave-dock command for %s could not be queued",
+                self.device_name,
+            )
+            raise self._command_failed_error()
+
         await self.async_start_command_report_watch("leave_dock")
+
+    async def _async_request_report_snapshot_guarded(
+        self, *, priority: bool = False, reason: str
+    ) -> None:
+        """Request a guarded report snapshot when supported by the coordinator."""
+
+    def _schedule_command_report_snapshot_refresh(self, reason: str) -> None:
+        """Schedule a delayed report refresh when supported by the coordinator."""
+
+    def _cancel_command_report_snapshot_refreshes(self) -> None:
+        """Cancel delayed command report refresh callbacks."""
 
     async def async_cancel_task(self) -> None:
         """Cancel task."""
@@ -1614,6 +1629,7 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         self._last_report_sys_status: int | None = None
         self._pause_stream_stop_unsub: CALLBACK_TYPE | None = None
         self._dock_access_poll_unsub: CALLBACK_TYPE | None = None
+        self._command_report_snapshot_unsubs: list[CALLBACK_TYPE] = []
         self._cloud_stream_requesting = False
         self._dock_access_poll_requesting = False
         self._last_cloud_budget_log_at = 0.0
@@ -1634,6 +1650,7 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         """Cancel report-watch timers and subscriptions on shutdown."""
         self._cancel_pause_stream_stop()
         self._cancel_dock_access_poll()
+        self._cancel_command_report_snapshot_refreshes()
         await super().async_shutdown()
 
     @callback
@@ -1752,6 +1769,7 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
                 self.device_name,
                 reason,
             )
+        self._schedule_command_report_snapshot_refresh(reason)
 
     def _has_usable_ble_transport(self) -> bool:
         """Return True when BLE can provide fresher local report data."""
@@ -1964,6 +1982,37 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
             return
         self._dock_access_poll_unsub()
         self._dock_access_poll_unsub = None
+
+    def _schedule_command_report_snapshot_refresh(self, reason: str) -> None:
+        """Request a prioritized snapshot shortly after a command transition."""
+        unsub_holder: list[CALLBACK_TYPE] = []
+
+        @callback
+        def _handle_command_report_snapshot(_: datetime.datetime) -> None:
+            if unsub_holder:
+                unsub = unsub_holder.pop()
+                if unsub in self._command_report_snapshot_unsubs:
+                    self._command_report_snapshot_unsubs.remove(unsub)
+            self.hass.async_create_task(
+                self._async_request_report_snapshot_guarded(
+                    priority=True,
+                    reason=f"{reason} command follow-up",
+                )
+            )
+
+        unsub = async_call_later(
+            self.hass,
+            COMMAND_REPORT_SNAPSHOT_DELAY,
+            _handle_command_report_snapshot,
+        )
+        unsub_holder.append(unsub)
+        self._command_report_snapshot_unsubs.append(unsub)
+
+    def _cancel_command_report_snapshot_refreshes(self) -> None:
+        """Cancel delayed command report refresh callbacks."""
+        for unsub in self._command_report_snapshot_unsubs:
+            unsub()
+        self._command_report_snapshot_unsubs.clear()
 
     def _schedule_dock_access_poll(self) -> None:
         """Schedule the next critical dock-access status snapshot."""
