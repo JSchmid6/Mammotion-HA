@@ -358,10 +358,22 @@ class MammotionLawnMowerEntity(MammotionBaseEntity, LawnMowerEntity):  # type: i
         try:
             if mode == WorkMode.MODE_WORKING:
                 trans_key = "pause_failed"
-                await self.coordinator.async_send_command("pause_execute_task")
+                await self.coordinator.async_send_and_wait(
+                    "pause_execute_task", "todev_taskctrl_ack"
+                )
+                await self.coordinator.async_start_command_report_watch(
+                    "pause_execute_task"
+                )
 
             trans_key = "dock_failed"
-            await self.coordinator.async_send_command("return_to_dock")
+            response = await self.coordinator.async_send_and_wait(
+                "return_to_dock", "todev_taskctrl_ack"
+            )
+            await self.coordinator.async_start_command_report_watch("return_to_dock")
+            if response is None:
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN, translation_key=trans_key
+                )
         except COMMAND_EXCEPTIONS as exc:
             raise HomeAssistantError(
                 translation_domain=DOMAIN, translation_key=trans_key

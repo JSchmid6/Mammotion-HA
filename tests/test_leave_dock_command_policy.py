@@ -9,11 +9,19 @@ from typing import Any
 COORDINATOR_PATH = (
     Path(__file__).parents[1] / "custom_components" / "mammotion" / "coordinator.py"
 )
+LAWN_MOWER_PATH = (
+    Path(__file__).parents[1] / "custom_components" / "mammotion" / "lawn_mower.py"
+)
 
 
 def _coordinator_tree() -> ast.Module:
     """Parse the coordinator without importing Home Assistant."""
     return ast.parse(COORDINATOR_PATH.read_text(encoding="utf-8"))
+
+
+def _lawn_mower_tree() -> ast.Module:
+    """Parse the lawn mower platform without importing Home Assistant."""
+    return ast.parse(LAWN_MOWER_PATH.read_text(encoding="utf-8"))
 
 
 def _class_def(tree: ast.Module, name: str) -> ast.ClassDef:
@@ -65,6 +73,21 @@ def test_leave_dock_queues_command_without_waiting_for_task_ack() -> None:
     assert "async_start_command_report_watch" in calls
     assert "async_send_and_wait" not in calls
     assert "todev_taskctrl_ack" not in _constant_values(leave_dock)
+
+
+def test_dock_waits_for_task_ack_and_starts_report_watch() -> None:
+    """Dock must not silently swallow failed return-to-dock command requests."""
+    tree = _lawn_mower_tree()
+    mower = _class_def(tree, "MammotionLawnMowerEntity")
+    dock = _method_def(mower, "async_dock")
+    calls = _called_function_names(dock)
+    constants = _constant_values(dock)
+
+    assert "async_send_and_wait" in calls
+    assert "async_start_command_report_watch" in calls
+    assert "async_send_command" not in calls
+    assert "return_to_dock" in constants
+    assert "todev_taskctrl_ack" in constants
 
 
 def test_command_report_watch_schedules_delayed_snapshot() -> None:
