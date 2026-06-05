@@ -1,0 +1,394 @@
+"""Regression tests for Mammotion pymammotion compatibility patches."""
+
+from __future__ import annotations
+
+import asyncio
+import importlib.util
+import sys
+import types
+from pathlib import Path
+from typing import Any
+
+import pytest
+from pymammotion.auth.token_manager import TokenManager
+from pymammotion.client import MammotionClient
+from pymammotion.data.model.device import MowerDevice
+from pymammotion.data.model.report_info import ReportData
+from pymammotion.data.mqtt.properties import MammotionPropertiesMessage
+from pymammotion.device.state_reducer import MowerStateReducer
+from pymammotion.proto import ReportInfoData, RptDevStatus, RptWork
+from pymammotion.transport.base import Transport
+from pymammotion.transport.mqtt import MQTTTransport
+from pymammotion.utility.constant.device_constant import WorkMode
+
+
+def _load_pymammotion_patches() -> Any:
+    """Load pymammotion_patches without importing the HA integration package."""
+    root = Path(__file__).parents[1]
+    custom_components_path = root / "custom_components"
+    mammotion_path = custom_components_path / "mammotion"
+
+    custom_components = sys.modules.setdefault(
+        "custom_components", types.ModuleType("custom_components")
+    )
+    custom_components.__path__ = [str(custom_components_path)]  # type: ignore[attr-defined]
+
+    mammotion = sys.modules.setdefault(
+        "custom_components.mammotion",
+        types.ModuleType("custom_components.mammotion"),
+    )
+    mammotion.__path__ = [str(mammotion_path)]  # type: ignore[attr-defined]
+
+    module_path = mammotion_path / "pymammotion_patches.py"
+    spec = importlib.util.spec_from_file_location(
+        "custom_components.mammotion.pymammotion_patches", module_path
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+patches = _load_pymammotion_patches()
+patches.apply_pymammotion_patches()
+
+
+def test_upstream_081_mqtt_auth_and_rate_guards_are_kept() -> None:
+    """PyMammotion 0.8.1 native transport/auth fixes are not monkeypatched."""
+    assert MQTTTransport.send.__module__ == "pymammotion.transport.mqtt"
+    assert Transport.record_send.__module__ == "pymammotion.transport.base"
+    assert (
+        TokenManager.force_refresh_invoke_token.__module__
+        == "pymammotion.auth.token_manager"
+    )
+    assert TokenManager.refresh_mqtt_creds.__module__ == (
+        "pymammotion.auth.token_manager"
+    )
+
+
+class _Response:
+    """Small response stub for login fallback tests."""
+
+    def __init__(self, code: int, msg: str) -> None:
+        """Store response code and message."""
+        self.code = code
+        self.msg = msg
+
+
+class _FakeHttp:
+    """Fake MammotionHTTP login surface."""
+
+    def __init__(self, v2: _Response, legacy: _Response) -> None:
+        """Store responses returned by each auth path."""
+        self.v2 = v2
+        self.legacy = legacy
+        self.calls: list[str] = []
+
+    async def login_v2(self, account: str, password: str) -> _Response:
+        """Return the configured v2 login response."""
+        self.calls.append("login_v2")
+        return self.v2
+
+    async def login(self, account: str, password: str) -> _Response:
+        """Return the configured legacy login response."""
+        self.calls.append("login")
+        return self.legacy
+
+
+def test_login_and_initiate_cloud_is_patched_for_legacy_shared_accounts() -> None:
+    """The integration patches PyMammotion's v2-only login entry point."""
+    assert (
+        MammotionClient.login_and_initiate_cloud.__module__
+        == "custom_components.mammotion.pymammotion_patches"
+    )
+
+
+def test_login_helper_uses_legacy_when_v2_rejects_shared_account() -> None:
+    """Shared test accounts may need the legacy Mammotion auth endpoint."""
+    fake = _FakeHttp(
+        v2=_Response(200, "Account or password mismatch"),
+        legacy=_Response(0, "Request success"),
+    )
+
+    response, legacy_used = asyncio.run(
+        patches._login_mammotion_http_with_legacy_fallback(  # noqa: SLF001
+            fake,
+            "test@example.com",
+            "secret",
+        )
+    )
+
+    assert response is fake.legacy
+    assert legacy_used is True
+    assert fake.calls == ["login_v2", "login"]
+
+
+def test_login_helper_keeps_successful_v2_response() -> None:
+    """The legacy endpoint is not called when v2 auth succeeds."""
+    fake = _FakeHttp(
+        v2=_Response(0, "Request success"),
+        legacy=_Response(0, "Request success"),
+    )
+
+    response, legacy_used = asyncio.run(
+        patches._login_mammotion_http_with_legacy_fallback(  # noqa: SLF001
+            fake,
+            "test@example.com",
+            "secret",
+        )
+    )
+
+    assert response is fake.v2
+    assert legacy_used is False
+    assert fake.calls == ["login_v2"]
+
+
+def test_empty_v2_device_page_still_bootstraps_aliyun(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Accepted shared devices may only be visible through Aliyun discovery."""
+    events: list[Any] = []
+    transport = types.SimpleNamespace(connected=False)
+
+    async def connect_transport() -> None:
+        """Record transport connection."""
+        transport.connected = True
+
+    transport.connect = connect_transport
+
+    class FakeCloudIOTGateway:
+        """Cloud gateway stub with one accepted shared device."""
+
+        def __init__(self, mammotion_http: object) -> None:
+            """Store required Aliyun setup responses."""
+            self.mammotion_http = mammotion_http
+            self.aep_response = object()
+            self.region_response = object()
+            self.session_by_authcode_response = types.SimpleNamespace(data=object())
+            self.devices_by_account_response = types.SimpleNamespace(
+                data=types.SimpleNamespace(
+                    data=[
+                        types.SimpleNamespace(
+                            device_name="Yuka-YVFR8E9D",
+                            iot_id="aliyun-iot",
+                            product_key="pk",
+                        )
+                    ]
+                )
+            )
+
+        async def get_shared_notice_list(self) -> object:
+            """Return no pending shares."""
+            return types.SimpleNamespace(data=types.SimpleNamespace(data=[]))
+
+    class FakeTokenManager:
+        """Token manager stub used by the account session."""
+
+        def __init__(
+            self,
+            account: str,
+            mammotion_http: object,
+            cloud_client: object,
+        ) -> None:
+            """Store constructor args for introspection."""
+            self.account = account
+            self.mammotion_http = mammotion_http
+            self.cloud_client = cloud_client
+            self.on_credentials_updated = None
+
+    class FakeClient:
+        """Mammotion client stub exposing the Aliyun bootstrap surface."""
+
+        on_credentials_updated = object()
+
+        async def _connect_iot(self, cloud_client: object) -> None:
+            """Record Aliyun cloud bootstrap."""
+            events.append(("connect_iot", cloud_client))
+
+        def _setup_aliyun_transport(
+            self,
+            cloud_client: object,
+            account_session: object,
+        ) -> object:
+            """Return the fake transport."""
+            events.append(("setup_transport", cloud_client, account_session))
+            return transport
+
+        async def _register_aliyun_device(
+            self,
+            device_name: str,
+            iot_id: str,
+            al_transport: object,
+            user_account: str,
+            product_key: str,
+            *,
+            token_manager: object,
+        ) -> None:
+            """Record registered devices."""
+            events.append(
+                (
+                    "register",
+                    device_name,
+                    iot_id,
+                    al_transport,
+                    user_account,
+                    product_key,
+                    token_manager,
+                )
+            )
+
+    monkeypatch.setattr(patches, "CloudIOTGateway", FakeCloudIOTGateway)
+    monkeypatch.setattr(patches, "TokenManager", FakeTokenManager)
+
+    account_session = types.SimpleNamespace(
+        user_account="user-account",
+        device_ids=set(),
+        cloud_client=None,
+        token_manager=None,
+        aliyun_transport=None,
+    )
+
+    asyncio.run(
+        patches._bootstrap_legacy_aliyun_if_needed(  # noqa: SLF001
+            FakeClient(),
+            "test@example.com",
+            object(),
+            account_session,
+            {},
+            legacy_login_used=False,
+            mammotion_records=[],
+        )
+    )
+
+    assert any(event[0] == "connect_iot" for event in events)
+    assert any(
+        event[:3] == ("register", "Yuka-YVFR8E9D", "aliyun-iot")
+        for event in events
+    )
+    assert account_session.device_ids == {"Yuka-YVFR8E9D"}
+    assert account_session.aliyun_transport is transport
+    assert transport.connected is True
+
+
+def _mower() -> MowerDevice:
+    """Return a mower with non-default report values."""
+    mower = MowerDevice(name="Luba-Test")
+    mower.report_data.dev.sys_status = int(WorkMode.MODE_WORKING)
+    mower.report_data.dev.battery_val = 77
+    mower.report_data.work.knife_height = 45
+    return mower
+
+
+def _properties(params: dict[str, Any]) -> MammotionPropertiesMessage:
+    """Build a Mammotion direct-MQTT property message."""
+    return MammotionPropertiesMessage.from_dict(
+        {
+            "id": "1",
+            "version": "1.0",
+            "sys": {},
+            "params": params,
+        }
+    )
+
+
+def test_mammotion_property_push_preserves_absent_status_scalars() -> None:
+    """Partial property posts must not turn absent scalar fields into zero state."""
+    reducer = MowerStateReducer()
+    current = _mower()
+    token = patches._REPORT_SOURCE_CONTEXT.set(  # noqa: SLF001
+        {
+            "transport": "cloud_mammotion",
+            "topic": "/sys/pk/dn/thing/event/property/post",
+            "property_keys": ("deviceVersion",),
+        }
+    )
+    try:
+        updated = reducer.apply_mammotion_properties(
+            current,
+            _properties({"deviceVersion": "1.2.3"}),
+        )
+    finally:
+        patches._REPORT_SOURCE_CONTEXT.reset(token)  # noqa: SLF001
+
+    assert updated.report_data.dev.sys_status == current.report_data.dev.sys_status
+    assert updated.report_data.dev.battery_val == current.report_data.dev.battery_val
+    assert (
+        updated.report_data.work.knife_height == current.report_data.work.knife_height
+    )
+    assert updated.device_firmwares.device_version == "1.2.3"
+
+
+def test_mammotion_property_push_accepts_explicit_zero_status() -> None:
+    """An explicitly present zero status is still a real Mammotion state update."""
+    reducer = MowerStateReducer()
+    current = _mower()
+    token = patches._REPORT_SOURCE_CONTEXT.set(  # noqa: SLF001
+        {
+            "transport": "cloud_mammotion",
+            "topic": "/sys/pk/dn/thing/event/property/post",
+            "property_keys": ("deviceState",),
+        }
+    )
+    try:
+        updated = reducer.apply_mammotion_properties(
+            current,
+            _properties({"deviceState": 0}),
+        )
+    finally:
+        patches._REPORT_SOURCE_CONTEXT.reset(token)  # noqa: SLF001
+
+    assert updated.report_data.dev.sys_status == 0
+    assert updated.report_data.dev.battery_val == current.report_data.dev.battery_val
+    assert (
+        updated.report_data.work.knife_height == current.report_data.work.knife_height
+    )
+
+
+def test_partial_active_report_clears_stale_charge_state() -> None:
+    """An active status without charge_state must not inherit dock charging."""
+    report = ReportData()
+    report.dev.sys_status = int(WorkMode.MODE_READY)
+    report.dev.charge_state = 1
+    report.dev.battery_val = 100
+
+    report.update(
+        ReportInfoData(dev=RptDevStatus(sys_status=int(WorkMode.MODE_WORKING)))
+    )
+
+    assert report.dev.sys_status == int(WorkMode.MODE_WORKING)
+    assert report.dev.charge_state == 0
+    assert report.dev.battery_val == 100
+
+
+def test_partial_returning_report_clears_stale_charge_state() -> None:
+    """Returning without charge_state must not keep a stale docked flag."""
+    report = ReportData()
+    report.dev.sys_status = int(WorkMode.MODE_READY)
+    report.dev.charge_state = 1
+    report.dev.battery_val = 95
+
+    report.update(
+        ReportInfoData(dev=RptDevStatus(sys_status=int(WorkMode.MODE_RETURNING)))
+    )
+
+    assert report.dev.sys_status == int(WorkMode.MODE_RETURNING)
+    assert report.dev.charge_state == 0
+    assert report.dev.battery_val == 95
+
+
+def test_partial_work_report_preserves_absent_job_fields() -> None:
+    """Partial work reports must not reset active job progress to defaults."""
+    report = ReportData()
+    report.work.area = (15 << 16) | 186
+    report.work.progress = (85 << 16) | 100
+    report.work.bp_info = 7
+    report.work.knife_height = 45
+
+    report.update(ReportInfoData(work=RptWork(knife_height=50)))
+
+    assert report.work.area == (15 << 16) | 186
+    assert report.work.progress == (85 << 16) | 100
+    assert report.work.bp_info == 7
+    assert report.work.knife_height == 50
