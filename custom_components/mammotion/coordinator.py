@@ -1729,11 +1729,11 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
 
     def is_entity_available(self) -> bool:
         """Return True when mower reports are recent enough for HA state."""
-        if not super().is_entity_available():
-            return False
         stale_after = self._report_stale_after().total_seconds()
         if self.has_fresh_report(max_age=stale_after):
             return True
+        if not super().is_entity_available():
+            return False
         now = time.monotonic()
         if (
             now - self._last_stale_availability_log_at
