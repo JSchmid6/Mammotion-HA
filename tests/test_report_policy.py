@@ -343,6 +343,60 @@ def test_stale_ready_after_active_job_is_rejected_without_time_window() -> None:
     assert "stale ready" in reason
 
 
+def test_ready_docked_reset_after_active_job_is_rejected() -> None:
+    """A docked-ready reset to empty job fields is stale after active mowing."""
+    previous = make_state(
+        sys_status=int(policy.WorkMode.MODE_WORKING),
+        charge_state=0,
+        battery_val=79,
+        work_area=encoded_high_word(40) | 186,
+        work_progress=encoded_high_word(60) | 100,
+    )
+    current = make_state(
+        sys_status=int(policy.WorkMode.MODE_READY),
+        charge_state=1,
+        battery_val=95,
+        work_area=0,
+        work_progress=0,
+    )
+
+    reason = policy.report_transition_rejection_reason(
+        previous,
+        current,
+        elapsed=timedelta(minutes=30),
+    )
+
+    assert reason is not None
+    assert "stale ready" in reason
+
+
+def test_ready_docked_with_preserved_unfinished_job_is_rejected() -> None:
+    """A partial ready+docked report must not publish while work remains open."""
+    previous = make_state(
+        sys_status=int(policy.WorkMode.MODE_WORKING),
+        charge_state=0,
+        battery_val=79,
+        work_area=encoded_high_word(40) | 186,
+        work_progress=encoded_high_word(60) | 100,
+    )
+    current = make_state(
+        sys_status=int(policy.WorkMode.MODE_READY),
+        charge_state=1,
+        battery_val=79,
+        work_area=encoded_high_word(40) | 186,
+        work_progress=encoded_high_word(60) | 100,
+    )
+
+    reason = policy.report_transition_rejection_reason(
+        previous,
+        current,
+        elapsed=timedelta(minutes=30),
+    )
+
+    assert reason is not None
+    assert "stale ready" in reason
+
+
 def test_real_return_to_ready_after_finished_job_is_accepted() -> None:
     """A finished returning job may become ready even when dock evidence is present."""
     previous = make_state(
@@ -371,7 +425,7 @@ def test_real_return_to_ready_after_finished_job_is_accepted() -> None:
 
 
 def test_active_to_ready_without_unfinished_current_job_is_accepted() -> None:
-    """A real cancellation/reset without remaining job data is not rejected."""
+    """A real away-from-dock cancellation/reset without job data is not rejected."""
     previous = make_state(
         sys_status=int(policy.WorkMode.MODE_WORKING),
         charge_state=0,

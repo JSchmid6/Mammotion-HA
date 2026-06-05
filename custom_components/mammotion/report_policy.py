@@ -250,10 +250,10 @@ def is_stale_active_ready_transition(
         return False
     if not has_unfinished_mow_job(previous):
         return False
-    if not has_unfinished_mow_job(current):
-        return False
     if not is_docked_report_state(current):
         return False
+    if has_unfinished_mow_job(current):
+        return True
     return job_progress_regressed(previous, current)
 
 

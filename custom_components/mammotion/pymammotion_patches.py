@@ -13,13 +13,18 @@ from datetime import timedelta
 from typing import Any
 
 import betterproto2
-from pymammotion.auth.token_manager import MQTTCredentials, TokenManager
+from pymammotion.account.registry import AccountSession
+from pymammotion.aliyun.cloud_gateway import CloudIOTGateway
+from pymammotion.aliyun.exceptions import CloudSetupError
+from pymammotion.auth.token_manager import TokenManager
+from pymammotion.client import MammotionClient
 from pymammotion.data.model.report_info import ReportData
 from pymammotion.device.handle import DeviceHandle
 from pymammotion.device.state_reducer import MowerStateReducer
+from pymammotion.http.http import MammotionHTTP
 from pymammotion.transport.base import (
     AuthError,
-    ReLoginRequiredError,
+    LoginFailedError,
     Transport,
     TransportRateLimitedError,
     TransportType,
@@ -35,17 +40,12 @@ from .report_policy import (
 _SEND_MARKED_PATCH_ATTR = "_mammotion_ha_cloud_safe_send_marked"
 _START_REPORT_STREAM_PATCH_ATTR = "_mammotion_ha_job_watch_report_stream"
 _FORCED_REPORT_STREAM_PATCH_ATTR = "_mammotion_ha_forced_report_stream"
-_MQTT_REALTIME_TOPICS_PATCH_ATTR = "_mammotion_ha_mqtt_realtime_topics_patch"
 _MQTT_PROTO_DISPATCH_PATCH_ATTR = "_mammotion_ha_mqtt_proto_dispatch_patch"
-_TRANSPORT_AUTH_PATCH_ATTR = "_mammotion_ha_transport_auth_state_patch"
-_RECORD_SEND_PATCH_ATTR = "_mammotion_ha_record_send_patch"
-_MQTT_SEND_PATCH_ATTR = "_mammotion_ha_mqtt_send_patch"
-_INVOKE_REFRESH_PATCH_ATTR = "_mammotion_ha_invoke_refresh_patch"
-_MQTT_CREDS_PATCH_ATTR = "_mammotion_ha_mqtt_creds_patch"
 _REPORT_PARTIAL_MERGE_PATCH_ATTR = "_mammotion_ha_report_partial_merge_patch"
 _REPORT_SANITY_PATCH_ATTR = "_mammotion_ha_report_sanity_patch"
+_MAMMOTION_PROPERTIES_PATCH_ATTR = "_mammotion_ha_mammotion_properties_patch"
 _RAW_MESSAGE_SOURCE_PATCH_ATTR = "_mammotion_ha_raw_message_source_patch"
-_INVOKE_REFRESH_COOLDOWN = 30.0
+_LEGACY_LOGIN_PATCH_ATTR = "_mammotion_ha_legacy_login_fallback_patch"
 _PATCH_WARNING_LOG_INTERVAL = 900.0
 _LOGGER = logging.getLogger(__name__)
 _last_patch_warning_log_at: dict[str, float] = {}
@@ -53,15 +53,15 @@ _REPORT_SOURCE_CONTEXT: contextvars.ContextVar[dict[str, Any] | None] = (
     contextvars.ContextVar("mammotion_ha_report_source", default=None)
 )
 
-_original_register_device = MQTTTransport.register_device
 _original_start_report_stream = DeviceHandle.start_report_stream
 _original_mqtt_dispatch = MQTTTransport._dispatch  # noqa: SLF001
-_original_mqtt_send = MQTTTransport.send
-_original_force_refresh_invoke_token = TokenManager.force_refresh_invoke_token
-_original_refresh_mqtt_creds = TokenManager.refresh_mqtt_creds
 _original_report_data_update = ReportData.update
 _original_mower_state_apply = MowerStateReducer.apply
+_original_apply_mammotion_properties = getattr(
+    MowerStateReducer, "apply_mammotion_properties", None
+)
 _original_on_raw_message = DeviceHandle.on_raw_message
+_original_login_and_initiate_cloud = MammotionClient.login_and_initiate_cloud
 
 
 def _patch_warning_allowed(key: str) -> bool:
@@ -105,9 +105,31 @@ async def _send_marked_cloud_safe(
         and time.monotonic() - last > 50
     ):
         sync = self.commands.send_todev_ble_sync(sync_type=3)
-        await transport.send(sync, iot_id=self.iot_id)
+        await transport.send(
+            sync,
+            iot_id=self.iot_id,
+            firmware_version=_current_firmware_version(self),
+        )
 
-    await transport.send(payload, iot_id=self.iot_id)
+    await transport.send(
+        payload,
+        iot_id=self.iot_id,
+        firmware_version=_current_firmware_version(self),
+    )
+    sent_bus = getattr(self, "_sent_bus", None)
+    if sent_bus is not None and not getattr(self, "_stopping", False):
+        await sent_bus.emit(payload)
+
+
+def _current_firmware_version(handle: DeviceHandle) -> str:
+    """Return the best known firmware version for pymammotion rate-limit logic."""
+    raw = getattr(getattr(handle, "snapshot", None), "raw", None)
+    update_check = getattr(raw, "update_check", None)
+    version = getattr(update_check, "current_version", None) or "1.0.0.0"
+    if version == "1.0.0.0":
+        mower_state = getattr(raw, "mower_state", None)
+        version = getattr(mower_state, "swversion", None) or version
+    return str(version)
 
 
 def _start_report_stream_allows_job_watch() -> bool:
@@ -206,12 +228,206 @@ async def _start_forced_report_stream(
 
 def apply_pymammotion_patches() -> None:
     """Apply pymammotion compatibility patches once."""
+    _patch_client_login()
     _patch_device_handle_send_and_streams()
     _patch_mqtt_transport()
-    _patch_transport_auth_and_rate_limits()
-    _patch_token_refresh()
     _patch_report_reducer()
     _patch_raw_message_source()
+
+
+def _patch_client_login() -> None:
+    """Patch Mammotion cloud login for accounts accepted by the legacy endpoint."""
+    if not getattr(MammotionClient, _LEGACY_LOGIN_PATCH_ATTR, False):
+        setattr(
+            MammotionClient,
+            "login_and_initiate_cloud",
+            _login_and_initiate_cloud_with_legacy_fallback,
+        )
+        setattr(MammotionClient, _LEGACY_LOGIN_PATCH_ATTR, True)
+
+
+async def _login_and_initiate_cloud_with_legacy_fallback(
+    self: MammotionClient,
+    account: str,
+    password: str,
+    session: Any | None = None,
+) -> None:
+    """Log in and register devices, falling back for legacy shared accounts."""
+    await self._sign_out_existing_session(account)  # noqa: SLF001
+    mammotion_http = MammotionHTTP(session=session, ha_version=self._ha_version)  # noqa: SLF001
+    login_resp, legacy_login_used = await _login_mammotion_http_with_legacy_fallback(
+        mammotion_http,
+        account,
+        password,
+    )
+    if getattr(login_resp, "code", None) != 0:
+        raise LoginFailedError(account, getattr(login_resp, "msg", "Login failed"))
+
+    device_list_owned_resp = await mammotion_http.get_user_device_list()
+    device_list_resp = await mammotion_http.get_user_shared_device_page()
+    if device_list_resp.data and device_list_resp.data.records:
+        pending_by_batch: dict[str, list[int]] = {}
+        for record in device_list_resp.data.records:
+            if record.is_receiver == 1 and record.status == -1:
+                pending_by_batch.setdefault(record.batch_id, []).append(
+                    int(record.record_id)
+                )
+        for batch_id, record_ids in pending_by_batch.items():
+            await mammotion_http.confirm_share(batch_id, record_ids)
+
+    device_page_resp = await mammotion_http.get_user_device_page()
+    mammotion_records = (
+        device_page_resp.data.records if device_page_resp.data else []
+    ) or []
+
+    owned_iot_id_map: dict[str, str] = {
+        d.device_name: d.iot_id
+        for d in (device_list_owned_resp.data or [])
+        if d.device_name and d.iot_id
+    }
+
+    acct_session = AccountSession(
+        account_id=account,
+        email=account,
+        password=password,
+        mammotion_http=mammotion_http,
+    )
+    acct_session.user_account = self._extract_user_account(mammotion_http)  # noqa: SLF001
+
+    await _bootstrap_legacy_aliyun_if_needed(
+        self,
+        account,
+        mammotion_http,
+        acct_session,
+        owned_iot_id_map,
+        legacy_login_used=legacy_login_used,
+        mammotion_records=mammotion_records,
+    )
+
+    if mammotion_records:
+        await self._bootstrap_mammotion_mqtt(  # noqa: SLF001
+            account,
+            mammotion_http,
+            acct_session,
+            owned_iot_id_map,
+        )
+
+    await self._account_registry.register(acct_session)  # noqa: SLF001
+
+
+async def _login_mammotion_http_with_legacy_fallback(
+    mammotion_http: MammotionHTTP,
+    account: str,
+    password: str,
+) -> tuple[Any, bool]:
+    """Return a successful login response, trying legacy auth after v2 failure."""
+    login_resp = await mammotion_http.login_v2(account, password)
+    if getattr(login_resp, "code", None) == 0:
+        return login_resp, False
+
+    legacy_resp = await mammotion_http.login(account, password)
+    if getattr(legacy_resp, "code", None) == 0:
+        _log_patch_warning(
+            "legacy-login-fallback",
+            (
+                "pymammotion login_v2 failed for account %s with %s; "
+                "legacy Mammotion login succeeded"
+            ),
+            _redacted_account(account),
+            getattr(login_resp, "msg", None),
+        )
+        return legacy_resp, True
+
+    return login_resp, False
+
+
+async def _bootstrap_legacy_aliyun_if_needed(
+    client: MammotionClient,
+    account: str,
+    mammotion_http: MammotionHTTP,
+    acct_session: AccountSession,
+    owned_iot_id_map: dict[str, str],
+    *,
+    legacy_login_used: bool,
+    mammotion_records: list[Any],
+) -> None:
+    """Register legacy Aliyun devices for accounts that v2 cannot enumerate."""
+    if not legacy_login_used and mammotion_records:
+        return
+
+    cloud_client = CloudIOTGateway(mammotion_http)
+    try:
+        await client._connect_iot(cloud_client)  # noqa: SLF001
+    except (
+        AuthError,
+        CloudSetupError,
+        OSError,
+        RuntimeError,
+        TimeoutError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        if legacy_login_used:
+            _log_patch_warning(
+                "legacy-aliyun-bootstrap",
+                (
+                    "pymammotion legacy login succeeded for account %s, but "
+                    "Aliyun device bootstrap failed with %s: %s"
+                ),
+                _redacted_account(account),
+                type(exc).__name__,
+                exc,
+            )
+        return
+
+    shared_notice = await cloud_client.get_shared_notice_list()
+    if shared_notice.data and shared_notice.data.data:
+        pending = [d.record_id for d in shared_notice.data.data if d.status == -1]
+        if pending:
+            await cloud_client.confirm_share(pending)
+
+    if (
+        cloud_client.aep_response is None
+        or cloud_client.region_response is None
+        or cloud_client.session_by_authcode_response is None
+        or cloud_client.session_by_authcode_response.data is None
+    ):
+        return
+
+    acct_session.cloud_client = cloud_client
+    acct_session.token_manager = TokenManager(account, mammotion_http, cloud_client)
+    acct_session.token_manager.on_credentials_updated = client.on_credentials_updated
+    al_transport = client._setup_aliyun_transport(cloud_client, acct_session)  # noqa: SLF001
+    acct_session.aliyun_transport = al_transport
+    user_account = acct_session.user_account
+
+    device_response = cloud_client.devices_by_account_response
+    devices = device_response.data.data if device_response and device_response.data else []
+    for device in devices:
+        if not device.device_name:
+            continue
+        iot_id = owned_iot_id_map.get(device.device_name) or device.iot_id
+        await client._register_aliyun_device(  # noqa: SLF001
+            device.device_name,
+            iot_id,
+            al_transport,
+            user_account,
+            device.product_key,
+            token_manager=acct_session.token_manager,
+        )
+        acct_session.device_ids.add(device.device_name)
+    await al_transport.connect()
+
+
+def _redacted_account(account: str) -> str:
+    """Return a log-safe account identifier."""
+    if "@" in account:
+        local, domain = account.split("@", 1)
+        prefix = local[:2] if len(local) > 2 else local[:1]
+        return f"{prefix}***@{domain}"
+    if len(account) <= 4:
+        return "*" * len(account)
+    return f"{account[:2]}***{account[-2:]}"
 
 
 def _patch_device_handle_send_and_streams() -> None:
@@ -233,58 +449,12 @@ def _patch_device_handle_send_and_streams() -> None:
 
 
 def _patch_mqtt_transport() -> None:
-    """Patch MQTT topic registration, dispatch, and send guards."""
-    if not getattr(MQTTTransport, _MQTT_REALTIME_TOPICS_PATCH_ATTR, False):
-        setattr(MQTTTransport, "register_device", _register_device_with_realtime_topics)
-        setattr(MQTTTransport, _MQTT_REALTIME_TOPICS_PATCH_ATTR, True)
-
+    """Patch MQTT proto dispatch routing."""
     if not _mqtt_dispatch_proto_aware() and not getattr(
         MQTTTransport, _MQTT_PROTO_DISPATCH_PATCH_ATTR, False
     ):
         setattr(MQTTTransport, "_dispatch", _mqtt_dispatch_with_proto_routing)
         setattr(MQTTTransport, _MQTT_PROTO_DISPATCH_PATCH_ATTR, True)
-
-    if not _mqtt_send_rate_auth_safe() and not getattr(
-        MQTTTransport, _MQTT_SEND_PATCH_ATTR, False
-    ):
-        setattr(MQTTTransport, "send", _mqtt_send_with_rate_and_auth_guard)
-        setattr(MQTTTransport, _MQTT_SEND_PATCH_ATTR, True)
-
-
-def _patch_transport_auth_and_rate_limits() -> None:
-    """Patch base transport auth and rate-limit helpers."""
-    if not _transport_auth_state_already_present() and not getattr(
-        Transport, _TRANSPORT_AUTH_PATCH_ATTR, False
-    ):
-        Transport.is_usable = property(_transport_is_usable_auth_safe)  # type: ignore[attr-defined,method-assign]
-        setattr(Transport, "mark_auth_failed", _mark_auth_failed)
-        setattr(Transport, "clear_auth_failed", _clear_auth_failed)
-        setattr(Transport, _TRANSPORT_AUTH_PATCH_ATTR, True)
-
-    if not _record_send_warns_once() and not getattr(
-        Transport, _RECORD_SEND_PATCH_ATTR, False
-    ):
-        setattr(Transport, "record_send", _record_send_warn_once)
-        setattr(Transport, _RECORD_SEND_PATCH_ATTR, True)
-
-
-def _patch_token_refresh() -> None:
-    """Patch token refresh edge cases."""
-    if not _invoke_refresh_has_cooldown() and not getattr(
-        TokenManager, _INVOKE_REFRESH_PATCH_ATTR, False
-    ):
-        setattr(
-            TokenManager,
-            "force_refresh_invoke_token",
-            _force_refresh_invoke_token_with_cooldown,
-        )
-        setattr(TokenManager, _INVOKE_REFRESH_PATCH_ATTR, True)
-
-    if not _refresh_mqtt_creds_rejects_none() and not getattr(
-        TokenManager, _MQTT_CREDS_PATCH_ATTR, False
-    ):
-        setattr(TokenManager, "refresh_mqtt_creds", _refresh_mqtt_creds_require_result)
-        setattr(TokenManager, _MQTT_CREDS_PATCH_ATTR, True)
 
 
 def _patch_report_reducer() -> None:
@@ -296,6 +466,16 @@ def _patch_report_reducer() -> None:
     if not getattr(MowerStateReducer, _REPORT_SANITY_PATCH_ATTR, False):
         setattr(MowerStateReducer, "apply", _mower_state_apply_with_report_sanity)
         setattr(MowerStateReducer, _REPORT_SANITY_PATCH_ATTR, True)
+
+    if _original_apply_mammotion_properties is not None and not getattr(
+        MowerStateReducer, _MAMMOTION_PROPERTIES_PATCH_ATTR, False
+    ):
+        setattr(
+            MowerStateReducer,
+            "apply_mammotion_properties",
+            _apply_mammotion_properties_preserve_absent_scalars,
+        )
+        setattr(MowerStateReducer, _MAMMOTION_PROPERTIES_PATCH_ATTR, True)
 
 
 def _patch_raw_message_source() -> None:
@@ -328,13 +508,47 @@ def _report_data_update_preserve_partial_state(self: ReportData, data: Any) -> N
     """Update report data without letting partial dev/connect reports reset state."""
     previous_dev = deepcopy(self.dev) if data.dev is not None else None
     previous_connect = deepcopy(self.connect) if data.connect is not None else None
+    previous_work = deepcopy(self.work) if data.work is not None else None
 
     _original_report_data_update(self, data)
 
     if previous_dev is not None:
         self.dev = _merge_model_update(previous_dev, data.dev)
+        _normalize_partial_dev_update(self.dev, data.dev)
     if previous_connect is not None:
         self.connect = _merge_model_update(previous_connect, data.connect)
+    if previous_work is not None:
+        self.work = _merge_model_update(previous_work, data.work)
+
+
+def _normalize_partial_dev_update(dev: Any, proto_update: Any) -> None:
+    """Keep preserved dev fields compatible with an explicit status update."""
+    incoming = proto_update.to_dict(casing=betterproto2.Casing.SNAKE)
+    if "sys_status" not in incoming or "charge_state" in incoming:
+        return
+
+    if incoming["sys_status"] not in {
+        int(WorkMode.MODE_WORKING),
+        int(WorkMode.MODE_RETURNING),
+    }:
+        return
+
+    if getattr(dev, "charge_state", 0) == 0:
+        return
+
+    _log_patch_warning(
+        "partial-report-active-charge-clear",
+        (
+            "pymammotion report reducer cleared stale charge_state after "
+            "active sys_status without charge_state: sys_status=%s; "
+            "previous_charge_state=%s; source=%s; incoming_dev=%s"
+        ),
+        incoming["sys_status"],
+        getattr(dev, "charge_state", None),
+        _current_report_source(),
+        incoming,
+    )
+    dev.charge_state = 0
 
 
 def _merge_model_update(current: Any, proto_update: Any) -> Any:
@@ -393,6 +607,58 @@ def _mower_state_apply_with_report_sanity(
 
     setattr(self, "_mammotion_ha_last_report_accept_at", now)
     return updated
+
+
+def _apply_mammotion_properties_preserve_absent_scalars(
+    self: MowerStateReducer,
+    current: Any,
+    properties: Any,
+) -> Any:
+    """Apply Mammotion property pushes without turning absent scalars into state."""
+    if _original_apply_mammotion_properties is None:
+        return current
+
+    updated = _original_apply_mammotion_properties(self, current, properties)
+    property_keys = _mammotion_property_keys()
+    restored: list[str] = []
+
+    if not _property_key_present(
+        property_keys, "batteryPercentage", "battery_percentage"
+    ):
+        updated.report_data.dev.battery_val = current.report_data.dev.battery_val
+        restored.append("batteryPercentage")
+    if not _property_key_present(property_keys, "deviceState", "device_state"):
+        updated.report_data.dev.sys_status = current.report_data.dev.sys_status
+        restored.append("deviceState")
+    if not _property_key_present(property_keys, "knifeHeight", "knife_height"):
+        updated.report_data.work.knife_height = current.report_data.work.knife_height
+        restored.append("knifeHeight")
+
+    if restored:
+        _log_patch_warning(
+            "mammotion-property-partial-scalars",
+            (
+                "pymammotion property reducer preserved absent scalar defaults: "
+                "restored=%s; source=%s"
+            ),
+            restored,
+            _current_report_source(),
+        )
+    return updated
+
+
+def _mammotion_property_keys() -> set[str]:
+    """Return raw Mammotion property keys from the active dispatch context."""
+    source = _current_report_source()
+    property_keys = source.get("property_keys")
+    if not isinstance(property_keys, (list, tuple, set, frozenset)):
+        return set()
+    return {str(key) for key in property_keys}
+
+
+def _property_key_present(property_keys: set[str], *aliases: str) -> bool:
+    """Return True when a Mammotion property key was present in the raw payload."""
+    return any(alias in property_keys for alias in aliases)
 
 
 def _log_report_diagnostic_if_needed(
@@ -515,26 +781,6 @@ def _current_report_source() -> dict[str, Any]:
     return _REPORT_SOURCE_CONTEXT.get() or {"transport": "unknown", "topic": "unknown"}
 
 
-def _register_device_with_realtime_topics(
-    self: MQTTTransport, product_key: str, device_name: str, iot_id: str
-) -> None:
-    """Register Mammotion MQTT devices with additional realtime push topics."""
-    _original_register_device(self, product_key, device_name, iot_id)
-    base_topic = f"/sys/{product_key}/{device_name}"
-    for topic in (
-        f"{base_topic}/thing/event/+/post",
-        f"/sys/proto/{product_key}/{device_name}/thing/event/+/post",
-        f"{base_topic}/app/down/thing/status",
-        f"{base_topic}/app/down/thing/properties",
-        f"{base_topic}/app/down/thing/events",
-        f"{base_topic}/app/down/thing/model/down_raw",
-        f"{base_topic}/app/down/_thing/event/notify",
-        f"{base_topic}/app/down/thing/event/property/post_reply",
-        f"{base_topic}/thing/event/property/post",
-    ):
-        self.add_topic(topic)
-
-
 def _mqtt_dispatch_proto_aware() -> bool:
     """Return True when upstream parses /sys/proto/<pk>/<dn> topics correctly."""
     try:
@@ -582,6 +828,7 @@ def _mqtt_source_context(
     for key in ("iotId", "identifier", "time"):
         if key in params:
             source[key] = params[key]
+    source["property_keys"] = tuple(sorted(str(key) for key in params))
     source["payload"] = "json-envelope"
     return source
 
@@ -615,192 +862,3 @@ async def _mqtt_dispatch_with_proto_routing_inner(
         decoded = raw
 
     await self.on_device_message(iot_id, decoded)
-
-
-def _transport_auth_state_already_present() -> bool:
-    """Return True when upstream already tracks auth-failed transport state."""
-    if not all(
-        hasattr(Transport, name) for name in ("mark_auth_failed", "clear_auth_failed")
-    ):
-        return False
-    try:
-        source = inspect.getsource(Transport.is_usable.fget)  # type: ignore[arg-type]
-    except OSError, TypeError:
-        return False
-    return "_auth_failed" in source
-
-
-def _transport_is_usable_auth_safe(self: Transport) -> bool:
-    """Return whether the transport is usable after local auth-failure gating."""
-    return not getattr(self, "_auth_failed", False)
-
-
-def _mark_auth_failed(self: Transport) -> None:
-    """Mark the transport unusable until a successful re-login clears it."""
-    setattr(self, "_auth_failed", True)
-
-
-def _clear_auth_failed(self: Transport) -> None:
-    """Clear the local auth-failed marker after successful credential recovery."""
-    setattr(self, "_auth_failed", False)
-
-
-def _record_send_warns_once() -> bool:
-    """Return True when upstream already logs the send-limit warning once."""
-    try:
-        source = inspect.getsource(Transport.record_send)
-    except OSError, TypeError:
-        return False
-    return "if not self.is_rate_limited" in source
-
-
-def _record_send_warn_once(self: Transport) -> None:
-    """Record an outbound send without spamming warnings past the quota."""
-    now = time.monotonic()
-    self._last_send_monotonic = now  # noqa: SLF001
-    self._send_timestamps.append(now)  # noqa: SLF001
-    cutoff = now - self._SEND_WINDOW  # noqa: SLF001
-    while self._send_timestamps and self._send_timestamps[0] < cutoff:  # noqa: SLF001
-        self._send_timestamps.popleft()  # noqa: SLF001
-    if len(self._send_timestamps) >= self._SEND_LIMIT:  # noqa: SLF001
-        if not self.is_rate_limited:
-            _LOGGER.warning(
-                "%s: %d sends in %.0f h - self-imposing rate limit",
-                type(self).__name__,
-                len(self._send_timestamps),  # noqa: SLF001
-                self._SEND_WINDOW / 3600,  # noqa: SLF001
-            )
-        self.set_rate_limited()
-
-
-def _mqtt_send_rate_auth_safe() -> bool:
-    """Return True when upstream MQTT send has both rate and auth-failure guards."""
-    try:
-        source = inspect.getsource(MQTTTransport.send)
-    except OSError, TypeError:
-        return False
-    return "if self.is_rate_limited" in source and "mark_auth_failed" in source
-
-
-async def _mqtt_send_with_rate_and_auth_guard(
-    self: MQTTTransport, payload: bytes, iot_id: str = ""
-) -> None:
-    """Send while honoring local rate-limit and fatal-auth guards."""
-    if self.is_rate_limited:
-        remaining = self._rate_limited_until - time.monotonic()  # noqa: SLF001
-        raise TransportRateLimitedError(
-            f"MQTTTransport rate-limited for {remaining:.0f}s more"
-        )
-    try:
-        await _original_mqtt_send(self, payload, iot_id)
-    except ReLoginRequiredError as exc:
-        _log_patch_warning(
-            "mqtt-auth-failed",
-            "MQTT transport authentication failed; marking transport unusable "
-            "until credentials are refreshed: %s",
-            exc,
-        )
-        _mark_transport_auth_failed(self)
-        await _fire_fatal_auth(self, exc)
-        raise
-
-
-async def _fire_fatal_auth(transport: MQTTTransport, exc: Exception) -> None:
-    """Run the upstream fatal-auth callback and clear the guard on recovery."""
-    callback = transport.on_fatal_auth_error
-    if callback is None:
-        return
-    try:
-        await callback(exc)
-    except Exception:  # noqa: BLE001
-        if _patch_warning_allowed("fatal-auth-callback"):
-            _LOGGER.exception("Fatal MQTT auth recovery callback failed")
-        return
-    _clear_transport_auth_failed(transport)
-
-
-def _invoke_refresh_has_cooldown() -> bool:
-    """Return True when upstream already rate-limits invoke-token refresh failures."""
-    try:
-        source = inspect.getsource(TokenManager.force_refresh_invoke_token)
-    except OSError, TypeError:
-        return False
-    return "_invoke_refresh_failed_at" in source
-
-
-async def _force_refresh_invoke_token_with_cooldown(self: TokenManager) -> None:
-    """Avoid hammering auth after repeated invoke-token refresh failures."""
-    failed_at = getattr(self, "_invoke_refresh_failed_at", None)
-    if failed_at is not None:
-        elapsed = time.monotonic() - failed_at
-        if elapsed < _INVOKE_REFRESH_COOLDOWN:
-            raise ReLoginRequiredError(
-                _token_manager_account_id(self),
-                "invoke token refresh in cooldown "
-                f"({_INVOKE_REFRESH_COOLDOWN - elapsed:.0f}s remaining)",
-            )
-    try:
-        await _original_force_refresh_invoke_token(self)
-    except (AuthError, ReLoginRequiredError) as exc:
-        setattr(self, "_invoke_refresh_failed_at", time.monotonic())
-        _log_patch_warning(
-            "invoke-token-refresh",
-            "Mammotion invoke-token refresh failed; backing off for %.0fs: %s",
-            _INVOKE_REFRESH_COOLDOWN,
-            exc,
-        )
-        raise
-    setattr(self, "_invoke_refresh_failed_at", None)
-
-
-def _refresh_mqtt_creds_rejects_none() -> bool:
-    """Return True when upstream raises if MQTT credential refresh returns None."""
-    try:
-        source = inspect.getsource(TokenManager.refresh_mqtt_creds)
-    except OSError, TypeError:
-        return False
-    return "MQTT credentials not set after refresh" in source
-
-
-async def _refresh_mqtt_creds_require_result(self: TokenManager) -> MQTTCredentials:
-    """Raise a re-login error instead of returning None MQTT credentials."""
-    creds = await _original_refresh_mqtt_creds(self)
-    if creds is None:
-        _log_patch_warning(
-            "mqtt-creds-none",
-            "Mammotion MQTT credential refresh returned no credentials",
-        )
-        raise ReLoginRequiredError(
-            _token_manager_account_id(self),
-            "MQTT credentials not set after refresh",
-        )
-    return creds
-
-
-def _token_manager_account_id(token_manager: TokenManager) -> str:
-    """Return the account id across pymammotion versions."""
-    return str(
-        getattr(
-            token_manager,
-            "account_id",
-            getattr(token_manager, "_account_id", ""),
-        )
-    )
-
-
-def _mark_transport_auth_failed(transport: Transport) -> None:
-    """Call mark_auth_failed across pymammotion versions."""
-    mark_auth_failed = getattr(transport, "mark_auth_failed", None)
-    if mark_auth_failed is None:
-        _mark_auth_failed(transport)
-        return
-    mark_auth_failed()
-
-
-def _clear_transport_auth_failed(transport: Transport) -> None:
-    """Call clear_auth_failed across pymammotion versions."""
-    clear_auth_failed = getattr(transport, "clear_auth_failed", None)
-    if clear_auth_failed is None:
-        _clear_auth_failed(transport)
-        return
-    clear_auth_failed()
