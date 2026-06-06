@@ -16,6 +16,8 @@ CLOUD_REPORT_DOCK_ACCESS_INTERVAL = timedelta(seconds=15)
 CLOUD_REPORT_TRANSITION_INTERVAL = timedelta(seconds=15)
 REPORT_FRESHNESS_MIN_AGE = timedelta(minutes=5)
 REPORT_FRESHNESS_MISSED_POLLS = 2
+REPORT_AVAILABILITY_PROBE_TIMEOUT = timedelta(seconds=25)
+REPORT_AVAILABILITY_PROBE_MIN_INTERVAL = timedelta(minutes=5)
 CLOUD_REPORT_SEND_RESERVE = 40
 CLOUD_REPORT_CRITICAL_SEND_RESERVE = 10
 CLOUD_REPORT_BUDGET_LOG_INTERVAL = 3600.0
@@ -188,6 +190,22 @@ def is_docked_report_state(state: ReportPolicyState) -> bool:
     return state.battery_val == 100
 
 
+def is_terminal_docked_report_state(state: ReportPolicyState) -> bool:
+    """Return True when a docked ready report also shows no open work."""
+    if state.sys_status != int(WorkMode.MODE_READY):
+        return False
+
+    if not is_docked_report_state(state):
+        return False
+
+    completion_percent = _high_word_or_none(state.work_area)
+    if completion_percent is not None and 0 < completion_percent < 100:
+        return False
+
+    left_time = _high_word_or_none(state.work_progress)
+    return left_time in (None, 0)
+
+
 def report_transition_rejection_reason(
     previous: ReportPolicyState,
     current: ReportPolicyState,
@@ -296,6 +314,9 @@ def error_report_interval(state: ReportPolicyState) -> timedelta:
 
 def has_unfinished_mow_job(state: ReportPolicyState) -> bool:
     """Return True when report fields indicate a resumable unfinished job."""
+    if is_terminal_docked_report_state(state):
+        return False
+
     if state.bp_info is not None and state.bp_info != 0:
         return True
 

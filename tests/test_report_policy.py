@@ -144,7 +144,12 @@ def test_dock_access_watch_does_not_start_too_early() -> None:
 
 def test_recharge_pause_with_unfinished_job_uses_watch_when_active() -> None:
     """A charging mower with an unfinished job remains watched once job-watch is active."""
-    state = make_state(charge_state=1, bp_info=1)
+    state = make_state(
+        charge_state=1,
+        bp_info=1,
+        work_area=encoded_high_word(40) | 186,
+        work_progress=encoded_high_word(60) | 100,
+    )
 
     assert policy.is_recharge_pause_state(state)
     assert policy.needs_continuous_report_stream(
@@ -159,6 +164,47 @@ def test_recharge_pause_with_unfinished_job_uses_watch_when_active() -> None:
             pause_watch_active=False,
         )
         == policy.CLOUD_REPORT_ACTIVE_INTERVAL
+    )
+
+
+def test_terminal_docked_report_ignores_stale_breakpoint_info() -> None:
+    """Ready+docked with no open work clears job-watch even when bp_info lingers."""
+    state = make_state(charge_state=1, bp_info=7, work_area=186, work_progress=0)
+
+    assert policy.is_terminal_docked_report_state(state)
+    assert not policy.has_unfinished_mow_job(state)
+    assert not policy.is_recharge_pause_state(state)
+    assert not policy.needs_continuous_report_stream(
+        state,
+        continuous_watch_active=True,
+        pause_watch_active=False,
+    )
+    assert (
+        policy.cloud_report_interval(
+            state,
+            continuous_watch_active=True,
+            pause_watch_active=False,
+        )
+        == policy.CLOUD_REPORT_DOCKED_INTERVAL
+    )
+
+
+def test_docked_report_with_preserved_work_remains_unfinished() -> None:
+    """Ready+docked reports still stay watched when real work fields remain open."""
+    state = make_state(
+        charge_state=1,
+        bp_info=7,
+        work_area=encoded_high_word(40) | 186,
+        work_progress=encoded_high_word(60) | 100,
+    )
+
+    assert not policy.is_terminal_docked_report_state(state)
+    assert policy.has_unfinished_mow_job(state)
+    assert policy.is_recharge_pause_state(state)
+    assert policy.needs_continuous_report_stream(
+        state,
+        continuous_watch_active=True,
+        pause_watch_active=False,
     )
 
 

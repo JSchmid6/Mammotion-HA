@@ -103,11 +103,14 @@ from .report_policy import (
     CLOUD_REPORT_STREAM_RENEW_INTERVAL,
     CLOUD_REPORT_STREAM_STATES,
     CLOUD_REPORT_TRANSITION_INTERVAL,
+    REPORT_AVAILABILITY_PROBE_MIN_INTERVAL,
+    REPORT_AVAILABILITY_PROBE_TIMEOUT,
     cloud_report_interval,
     has_unfinished_mow_job,
     is_active_report_state,
     is_pause_report_state,
     is_recharge_pause_state,
+    is_terminal_docked_report_state,
     needs_continuous_report_stream,
     needs_dock_access_watch,
     report_policy_state_from_device,
@@ -1636,6 +1639,9 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         self._last_cloud_snapshot_failure_log_at = 0.0
         self._last_accepted_report_at = 0.0
         self._last_report_sanity_log_at = 0.0
+        self._last_availability_probe_at = 0.0
+        self._availability_probe_until = 0.0
+        self._availability_probe_requesting = False
 
         self.poll_debouncer = Debouncer(
             hass,
@@ -1732,24 +1738,133 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         stale_after = self._report_stale_after().total_seconds()
         if self.has_fresh_report(max_age=stale_after):
             return True
+        if self._availability_probe_active() and self._last_report_age() is not None:
+            return True
         if not super().is_entity_available():
-            return False
-        now = time.monotonic()
-        if (
-            now - self._last_stale_availability_log_at
-            >= CLOUD_REPORT_BUDGET_LOG_INTERVAL
-        ):
-            self._last_stale_availability_log_at = now
-            LOGGER.warning(
-                "Mammotion reports for %s are stale or missing; marking mower "
-                "entities unavailable until a fresh device report arrives",
-                self.device_name,
+            self._log_stale_availability(
+                reason="transport unavailable",
+                stale_after=stale_after,
             )
+            return False
+        self._log_stale_availability(
+            reason="report stale",
+            stale_after=stale_after,
+        )
         return False
 
     def _report_stale_after(self) -> timedelta:
         """Return the age after which cached mower state is stale."""
         return report_stale_after(self._cloud_report_interval())
+
+    def _last_report_age(self) -> float | None:
+        """Return the age of the last raw mower report, if one was received."""
+        handle = self.manager.mower(self.device_name)
+        if handle is None:
+            return None
+        last_report_at = getattr(handle, "last_report_at", 0.0)
+        if not last_report_at:
+            return None
+        return time.monotonic() - last_report_at
+
+    def _availability_probe_active(self) -> bool:
+        """Return True while a stale report is being actively rechecked."""
+        return time.monotonic() < self._availability_probe_until
+
+    def _log_stale_availability(self, *, reason: str, stale_after: float) -> None:
+        """Log enough stale-report context for postmortem diagnosis."""
+        now = time.monotonic()
+        if (
+            now - self._last_stale_availability_log_at
+            < CLOUD_REPORT_BUDGET_LOG_INTERVAL
+        ):
+            return
+
+        self._last_stale_availability_log_at = now
+        state = report_policy_state_from_device(self.data)
+        age = self._last_report_age()
+        limit, used, rate_limited = self._cloud_send_budget()
+        LOGGER.warning(
+            "Mammotion reports for %s are stale or missing (%s); marking mower "
+            "entities unavailable until a fresh device report arrives; age=%s "
+            "stale_after=%.0fs interval=%.0fs online=%s sys_status=%s "
+            "charge_state=%s battery=%s bp_info=%s work_area=%s "
+            "work_progress=%s watches(job=%s command=%s pause=%s dock_access=%s) "
+            "cloud_budget=%s/%s rate_limited=%s",
+            self.device_name,
+            reason,
+            "never" if age is None else f"{age:.0f}s",
+            stale_after,
+            self._cloud_report_interval().total_seconds(),
+            super().is_entity_available(),
+            state.sys_status,
+            state.charge_state,
+            state.battery_val,
+            state.bp_info,
+            state.work_area,
+            state.work_progress,
+            self._continuous_report_watch_active(),
+            self._command_report_watch_active(),
+            self._pause_report_watch_active(),
+            self._dock_access_report_watch_active(),
+            used,
+            "unknown" if limit is None else limit,
+            rate_limited,
+        )
+
+    async def _async_probe_stale_report_if_needed(self, *, reason: str) -> None:
+        """Request one fresh report before letting an unclear state go stale."""
+        stale_after = self._report_stale_after().total_seconds()
+        if self.has_fresh_report(max_age=stale_after):
+            return
+        if self._availability_probe_requesting:
+            return
+
+        now = time.monotonic()
+        if (
+            now - self._last_availability_probe_at
+            < REPORT_AVAILABILITY_PROBE_MIN_INTERVAL.total_seconds()
+        ):
+            return
+
+        if not self._has_usable_ble_transport() and not self._cloud_snapshot_budget_allows(
+            priority=True
+        ):
+            return
+
+        self._last_availability_probe_at = now
+        self._availability_probe_requesting = True
+        self._availability_probe_until = (
+            now + REPORT_AVAILABILITY_PROBE_TIMEOUT.total_seconds()
+        )
+        try:
+            LOGGER.debug(
+                "report-coordinator [%s]: probing stale report for %s",
+                self.device_name,
+                reason,
+            )
+            if self._needs_continuous_report_stream(self.data):
+                await self._async_ensure_active_report_stream(
+                    reason=f"{reason} availability probe"
+                )
+            fresh = await self.async_wait_for_fresh_report(
+                max_age=stale_after,
+                timeout=REPORT_AVAILABILITY_PROBE_TIMEOUT.total_seconds(),
+            )
+        finally:
+            self._availability_probe_requesting = False
+            self._availability_probe_until = 0.0
+
+        if fresh:
+            LOGGER.debug(
+                "report-coordinator [%s]: stale report probe received fresh data",
+                self.device_name,
+            )
+            return
+
+        self._log_stale_availability(
+            reason=f"{reason} probe timed out",
+            stale_after=stale_after,
+        )
 
     async def async_start_command_report_watch(self, reason: str) -> None:
         """Watch for real report updates after a command-driven transition."""
@@ -1897,6 +2012,11 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         now = time.monotonic()
         sys_status = self._safe_sys_status(device)
         state = report_policy_state_from_device(device)
+        if is_terminal_docked_report_state(state):
+            self._clear_report_watches()
+            self._last_report_sys_status = sys_status
+            return
+
         if is_active_report_state(state) or is_recharge_pause_state(state):
             self._command_report_watch_until = 0.0
             self._job_watch_until = max(
@@ -1929,6 +2049,15 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
             self._cancel_pause_stream_stop()
 
         self._last_report_sys_status = sys_status
+
+    def _clear_report_watches(self) -> None:
+        """Clear transient report-watch timers after a terminal docked report."""
+        self._command_report_watch_until = 0.0
+        self._job_watch_until = 0.0
+        self._pause_watch_until = 0.0
+        self._dock_access_watch_until = 0.0
+        self._cancel_pause_stream_stop()
+        self._cancel_dock_access_poll()
 
     @staticmethod
     def _safe_sys_status(device: MowingDevice) -> int | None:
@@ -2297,6 +2426,8 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
 
     async def _async_update_data(self) -> MowingDevice:
         """Get data from the device."""
+        await self._async_probe_stale_report_if_needed(reason="periodic refresh")
+
         if data := await super()._async_update_data():
             return data
 

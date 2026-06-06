@@ -293,6 +293,65 @@ def _properties(params: dict[str, Any]) -> MammotionPropertiesMessage:
     )
 
 
+def _device_handle_with_report(
+    *,
+    sys_status: int,
+    charge_state: int,
+    bp_info: int,
+    work_area: int,
+    work_progress: int,
+) -> Any:
+    """Build a minimal DeviceHandle-like object for report-watch helpers."""
+    report_data = types.SimpleNamespace(
+        dev=types.SimpleNamespace(
+            sys_status=sys_status,
+            charge_state=charge_state,
+            battery_val=90,
+            last_status=None,
+        ),
+        work=types.SimpleNamespace(
+            bp_info=bp_info,
+            area=work_area,
+            progress=work_progress,
+        ),
+    )
+    return types.SimpleNamespace(
+        state_machine=types.SimpleNamespace(
+            current=types.SimpleNamespace(
+                raw=types.SimpleNamespace(report_data=report_data)
+            )
+        )
+    )
+
+
+def test_job_watch_patch_ignores_terminal_docked_breakpoint_info() -> None:
+    """The stream patch must not keep polling a finished docked mower forever."""
+    handle = _device_handle_with_report(
+        sys_status=int(WorkMode.MODE_READY),
+        charge_state=1,
+        bp_info=7,
+        work_area=186,
+        work_progress=0,
+    )
+
+    assert not patches._has_unfinished_mow_job(handle)  # noqa: SLF001
+    assert not patches._is_recharge_pause_report_state(handle)  # noqa: SLF001
+
+
+def test_job_watch_patch_keeps_real_unfinished_work() -> None:
+    """Open work fields still keep recharge-pause report watching alive."""
+    handle = _device_handle_with_report(
+        sys_status=int(WorkMode.MODE_READY),
+        charge_state=1,
+        bp_info=7,
+        work_area=(40 << 16) | 186,
+        work_progress=(60 << 16) | 100,
+    )
+
+    assert patches._has_unfinished_mow_job(handle)  # noqa: SLF001
+    assert patches._is_recharge_pause_report_state(handle)  # noqa: SLF001
+
+
 def test_mammotion_property_push_preserves_absent_status_scalars() -> None:
     """Partial property posts must not turn absent scalar fields into zero state."""
     reducer = MowerStateReducer()

@@ -33,6 +33,10 @@ from pymammotion.transport.mqtt import MQTTTransport
 from pymammotion.utility.constant.device_constant import WorkMode
 
 from .report_policy import (
+    has_unfinished_mow_job as _policy_has_unfinished_mow_job,
+)
+from .report_policy import (
+    is_terminal_docked_report_state,
     report_policy_state_from_device,
     report_transition_rejection_reason,
 )
@@ -144,28 +148,22 @@ def _start_report_stream_allows_job_watch() -> bool:
 def _has_unfinished_mow_job(self: DeviceHandle) -> bool:
     """Return True when current report data points to a resumable job."""
     try:
-        work = self.state_machine.current.raw.report_data.work
-        if int(work.bp_info) != 0:
-            return True
-
-        completion_percent = int(work.area) >> 16
-        if 0 < completion_percent < 100:
-            return True
-
-        left_time = int(work.progress) >> 16
+        state = report_policy_state_from_device(self.state_machine.current.raw)
     except AttributeError, TypeError, ValueError:
         return False
     else:
-        return left_time > 0
+        return _policy_has_unfinished_mow_job(state)
 
 
 def _is_recharge_pause_report_state(self: DeviceHandle) -> bool:
     """Return True when the mower is charging but a job still needs watching."""
     try:
-        dev = self.state_machine.current.raw.report_data.dev
-        if int(dev.sys_status) == int(WorkMode.MODE_CHARGING_PAUSE):
+        state = report_policy_state_from_device(self.state_machine.current.raw)
+        if state.sys_status == int(WorkMode.MODE_CHARGING_PAUSE):
             return True
-        return int(dev.charge_state) != 0 and _has_unfinished_mow_job(self)
+        if is_terminal_docked_report_state(state):
+            return False
+        return state.charge_state not in (None, 0) and _has_unfinished_mow_job(self)
     except AttributeError, TypeError, ValueError:
         return False
 
