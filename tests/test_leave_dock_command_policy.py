@@ -134,3 +134,32 @@ def test_report_availability_uses_fresh_report_before_transport_state() -> None:
     assert call_order.index("has_fresh_report") < call_order.index(
         "is_entity_available"
     )
+
+
+def test_report_update_probes_stale_state_before_base_update_short_circuit() -> None:
+    """Stale report probing must run before the base coordinator returns offline data."""
+    tree = _coordinator_tree()
+    report = _class_def(tree, "MammotionReportUpdateCoordinator")
+    update = _async_method_def(report, "_async_update_data")
+
+    call_order = [
+        call.func.attr
+        for call in ast.walk(update)
+        if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+    ]
+
+    assert call_order.index("_async_probe_stale_report_if_needed") < call_order.index(
+        "_async_update_data"
+    )
+
+
+def test_availability_probe_keeps_last_report_visible_while_in_flight() -> None:
+    """A pending probe should avoid an immediate HA unavailable flap."""
+    tree = _coordinator_tree()
+    report = _class_def(tree, "MammotionReportUpdateCoordinator")
+    is_available = _method_def(report, "is_entity_available")
+    calls = _called_function_names(is_available)
+
+    assert "_availability_probe_active" in calls
+    assert "_last_report_age" in calls
+    assert "_log_stale_availability" in calls
