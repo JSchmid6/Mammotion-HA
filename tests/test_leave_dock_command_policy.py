@@ -163,3 +163,25 @@ def test_availability_probe_keeps_last_report_visible_while_in_flight() -> None:
     assert "_availability_probe_active" in calls
     assert "_last_report_age" in calls
     assert "_log_stale_availability" in calls
+
+
+def test_availability_probe_has_failure_backoff() -> None:
+    """Failed stale-report probes must not self-amplify every refresh cycle."""
+    tree = _coordinator_tree()
+    report = _class_def(tree, "MammotionReportUpdateCoordinator")
+    probe = _async_method_def(report, "_async_probe_stale_report_if_needed")
+    calls = _called_function_names(probe)
+    names = {
+        node.id
+        for node in ast.walk(probe)
+        if isinstance(node, ast.Name)
+    }
+
+    assert "_schedule_next_availability_probe" in calls
+    assert "_availability_probe_backoff_seconds" in calls
+    assert "_availability_probe_failures" in {
+        attr.attr
+        for attr in ast.walk(probe)
+        if isinstance(attr, ast.Attribute)
+    }
+    assert "REPORT_AVAILABILITY_PROBE_MIN_INTERVAL" in names
