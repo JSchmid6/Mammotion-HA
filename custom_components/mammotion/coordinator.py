@@ -103,6 +103,7 @@ from .report_policy import (
     CLOUD_REPORT_STREAM_RENEW_INTERVAL,
     CLOUD_REPORT_STREAM_STATES,
     CLOUD_REPORT_TRANSITION_INTERVAL,
+    REPORT_AVAILABILITY_PROBE_MAX_INTERVAL,
     REPORT_AVAILABILITY_PROBE_MIN_INTERVAL,
     REPORT_AVAILABILITY_PROBE_TIMEOUT,
     cloud_report_interval,
@@ -1640,6 +1641,8 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         self._last_accepted_report_at = 0.0
         self._last_report_sanity_log_at = 0.0
         self._last_availability_probe_at = 0.0
+        self._next_availability_probe_at = 0.0
+        self._availability_probe_failures = 0
         self._availability_probe_until = 0.0
         self._availability_probe_requesting = False
 
@@ -1789,7 +1792,8 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
             "stale_after=%.0fs interval=%.0fs online=%s sys_status=%s "
             "charge_state=%s battery=%s bp_info=%s work_area=%s "
             "work_progress=%s watches(job=%s command=%s pause=%s dock_access=%s) "
-            "cloud_budget=%s/%s rate_limited=%s",
+            "probe_failures=%s next_probe_in=%.0fs cloud_budget=%s/%s "
+            "rate_limited=%s",
             self.device_name,
             reason,
             "never" if age is None else f"{age:.0f}s",
@@ -1806,32 +1810,57 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
             self._command_report_watch_active(),
             self._pause_report_watch_active(),
             self._dock_access_report_watch_active(),
+            self._availability_probe_failures,
+            max(0.0, self._next_availability_probe_at - now),
             used,
             "unknown" if limit is None else limit,
             rate_limited,
+        )
+
+    def _availability_probe_backoff_seconds(self) -> float:
+        """Return the next stale-report probe delay after consecutive failures."""
+        min_interval = REPORT_AVAILABILITY_PROBE_MIN_INTERVAL.total_seconds()
+        max_interval = REPORT_AVAILABILITY_PROBE_MAX_INTERVAL.total_seconds()
+        return min(
+            max_interval,
+            min_interval * (2 ** max(0, self._availability_probe_failures)),
+        )
+
+    def _schedule_next_availability_probe(self, now: float, delay: float) -> None:
+        """Delay the next stale-report probe attempt."""
+        self._next_availability_probe_at = max(
+            self._next_availability_probe_at,
+            now + delay,
         )
 
     async def _async_probe_stale_report_if_needed(self, *, reason: str) -> None:
         """Request one fresh report before letting an unclear state go stale."""
         stale_after = self._report_stale_after().total_seconds()
         if self.has_fresh_report(max_age=stale_after):
+            self._availability_probe_failures = 0
+            self._next_availability_probe_at = 0.0
             return
         if self._availability_probe_requesting:
             return
 
         now = time.monotonic()
-        if (
-            now - self._last_availability_probe_at
-            < REPORT_AVAILABILITY_PROBE_MIN_INTERVAL.total_seconds()
-        ):
+        if now < self._next_availability_probe_at:
             return
 
         if not self._has_usable_ble_transport() and not self._cloud_snapshot_budget_allows(
             priority=True
         ):
+            self._schedule_next_availability_probe(
+                now,
+                REPORT_AVAILABILITY_PROBE_MIN_INTERVAL.total_seconds(),
+            )
             return
 
         self._last_availability_probe_at = now
+        self._schedule_next_availability_probe(
+            now,
+            REPORT_AVAILABILITY_PROBE_MIN_INTERVAL.total_seconds(),
+        )
         self._availability_probe_requesting = True
         self._availability_probe_until = (
             now + REPORT_AVAILABILITY_PROBE_TIMEOUT.total_seconds()
@@ -1855,12 +1884,19 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
             self._availability_probe_until = 0.0
 
         if fresh:
+            self._availability_probe_failures = 0
+            self._next_availability_probe_at = 0.0
             LOGGER.debug(
                 "report-coordinator [%s]: stale report probe received fresh data",
                 self.device_name,
             )
             return
 
+        self._availability_probe_failures += 1
+        self._schedule_next_availability_probe(
+            time.monotonic(),
+            self._availability_probe_backoff_seconds(),
+        )
         self._log_stale_availability(
             reason=f"{reason} probe timed out",
             stale_after=stale_after,
