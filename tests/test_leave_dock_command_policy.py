@@ -136,6 +136,48 @@ def test_report_availability_uses_fresh_report_before_transport_state() -> None:
     )
 
 
+def test_report_availability_checks_true_offline_before_cached_state() -> None:
+    """Only an explicit offline report should hide cached mower state."""
+    tree = _coordinator_tree()
+    report = _class_def(tree, "MammotionReportUpdateCoordinator")
+    is_available = _method_def(report, "is_entity_available")
+
+    call_order = [
+        call.func.attr
+        for call in ast.walk(is_available)
+        if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+    ]
+
+    assert call_order.index("_device_reported_offline") < call_order.index(
+        "has_fresh_report"
+    )
+
+
+def test_stale_report_keeps_cached_state_visible_after_first_report() -> None:
+    """A stale report should not create docked->unavailable->docked flaps."""
+    tree = _coordinator_tree()
+    report = _class_def(tree, "MammotionReportUpdateCoordinator")
+    is_available = _method_def(report, "is_entity_available")
+    constants = _constant_values(is_available)
+
+    assert "report stale; keeping cached state visible" in constants
+
+
+def test_reported_offline_helper_uses_mqtt_offline_flag() -> None:
+    """True Mammotion offline semantics come from the handle availability flag."""
+    tree = _coordinator_tree()
+    report = _class_def(tree, "MammotionReportUpdateCoordinator")
+    helper = _method_def(report, "_device_reported_offline")
+    attrs = {
+        attr.attr
+        for attr in ast.walk(helper)
+        if isinstance(attr, ast.Attribute)
+    }
+
+    assert "_has_usable_ble_transport" in _called_function_names(helper)
+    assert "mqtt_reported_offline" in attrs
+
+
 def test_report_update_probes_stale_state_before_base_update_short_circuit() -> None:
     """Stale report probing must run before the base coordinator returns offline data."""
     tree = _coordinator_tree()
