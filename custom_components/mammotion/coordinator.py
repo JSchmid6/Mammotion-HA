@@ -1739,9 +1739,21 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
     def is_entity_available(self) -> bool:
         """Return True when mower reports are recent enough for HA state."""
         stale_after = self._report_stale_after().total_seconds()
+        if self._device_reported_offline():
+            self._log_stale_availability(
+                reason="device reported offline",
+                stale_after=stale_after,
+            )
+            return False
         if self.has_fresh_report(max_age=stale_after):
             return True
-        if self._availability_probe_active() and self._last_report_age() is not None:
+        if self._last_report_age() is not None:
+            if self._availability_probe_active():
+                return True
+            self._log_stale_availability(
+                reason="report stale; keeping cached state visible",
+                stale_after=stale_after,
+            )
             return True
         if not super().is_entity_available():
             self._log_stale_availability(
@@ -1754,6 +1766,18 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
             stale_after=stale_after,
         )
         return False
+
+    def _device_reported_offline(self) -> bool:
+        """Return True when Mammotion explicitly reported the mower offline."""
+        if self._has_usable_ble_transport():
+            return False
+        device = self.manager.get_device_by_name(self.device_name)
+        if device is not None and not device.online:
+            return True
+        handle = self.manager.mower(self.device_name)
+        if handle is None:
+            return False
+        return bool(handle.availability.mqtt_reported_offline)
 
     def _report_stale_after(self) -> timedelta:
         """Return the age after which cached mower state is stale."""
@@ -1785,10 +1809,14 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         self._last_stale_availability_log_at = now
         state = report_policy_state_from_device(self.data)
         age = self._last_report_age()
+        action = (
+            "keeping cached mower state visible"
+            if "keeping cached state visible" in reason
+            else "marking mower entities unavailable until a fresh device report arrives"
+        )
         limit, used, rate_limited = self._cloud_send_budget()
         LOGGER.warning(
-            "Mammotion reports for %s are stale or missing (%s); marking mower "
-            "entities unavailable until a fresh device report arrives; age=%s "
+            "Mammotion reports for %s are stale or missing (%s); %s; age=%s "
             "stale_after=%.0fs interval=%.0fs online=%s sys_status=%s "
             "charge_state=%s battery=%s bp_info=%s work_area=%s "
             "work_progress=%s watches(job=%s command=%s pause=%s dock_access=%s) "
@@ -1796,6 +1824,7 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
             "rate_limited=%s",
             self.device_name,
             reason,
+            action,
             "never" if age is None else f"{age:.0f}s",
             stale_after,
             self._cloud_report_interval().total_seconds(),
