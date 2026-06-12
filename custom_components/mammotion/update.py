@@ -17,6 +17,7 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from . import MammotionRTKCoordinator
 from .coordinator import MammotionBaseUpdateCoordinator
 from .entity import MammotionBaseEntity, MammotionBaseRTKEntity
+from .update_policy import firmware_update_in_progress, latest_firmware_version
 
 LOGGER = logging.getLogger(__name__)
 
@@ -87,13 +88,12 @@ class MammotionUpdateEntity(MammotionBaseEntity, UpdateEntity):
     @property
     def latest_version(self) -> str | None:
         """Latest version available for install."""
-        if (
-            self.coordinator.data.update_check.upgradeable
-            and self.coordinator.data.update_check.product_version_info_vo is not None
-        ):
-            new_version = self.coordinator.data.update_check.product_version_info_vo
-            return new_version.release_version
-        return self.installed_version
+        if self.coordinator.data is None:
+            return self.installed_version
+        return latest_firmware_version(
+            self.coordinator.data.update_check,
+            self.installed_version,
+        )
 
     @property
     def release_summary(self) -> str | None:
@@ -115,7 +115,13 @@ class MammotionUpdateEntity(MammotionBaseEntity, UpdateEntity):
     @property
     def in_progress(self) -> bool:
         """Update installation in progress."""
-        return self.coordinator.data.update_check.isupgrading
+        if self.coordinator.data is None:
+            return False
+        return firmware_update_in_progress(
+            self.coordinator.data.update_check,
+            self.installed_version,
+            self.latest_version,
+        )
 
     @property
     def update_percentage(self) -> int | float | None:
@@ -172,13 +178,12 @@ class MammotionRTKUpdateEntity(MammotionBaseRTKEntity, UpdateEntity):
     @property
     def latest_version(self) -> str | None:
         """Latest version available for install."""
-        if (
-            self.coordinator.data.update_check.upgradeable
-            and self.coordinator.data.update_check.product_version_info_vo is not None
-        ):
-            new_version = self.coordinator.data.update_check.product_version_info_vo
-            return new_version.release_version
-        return self.installed_version
+        if self.coordinator.data is None:
+            return self.installed_version
+        return latest_firmware_version(
+            self.coordinator.data.update_check,
+            self.installed_version,
+        )
 
     @property
     def release_summary(self) -> str | None:
@@ -200,7 +205,13 @@ class MammotionRTKUpdateEntity(MammotionBaseRTKEntity, UpdateEntity):
     @property
     def in_progress(self) -> bool:
         """Update installation in progress."""
-        return self.coordinator.data.update_check.isupgrading
+        if self.coordinator.data is None:
+            return False
+        return firmware_update_in_progress(
+            self.coordinator.data.update_check,
+            self.installed_version,
+            self.latest_version,
+        )
 
     @property
     def update_percentage(self) -> int | float | None:
