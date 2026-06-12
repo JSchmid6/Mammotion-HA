@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import sys
+import time
 import types
 from pathlib import Path
 from typing import Any
@@ -15,8 +17,10 @@ from pymammotion.client import MammotionClient
 from pymammotion.data.model.device import MowerDevice
 from pymammotion.data.model.report_info import ReportData
 from pymammotion.data.mqtt.properties import MammotionPropertiesMessage
+from pymammotion.device.handle import DeviceHandle
 from pymammotion.device.state_reducer import MowerStateReducer
 from pymammotion.proto import ReportInfoData, RptDevStatus, RptWork
+from pymammotion.transport.aliyun_mqtt import AliyunMQTTTransport
 from pymammotion.transport.base import Transport
 from pymammotion.transport.mqtt import MQTTTransport
 from pymammotion.utility.constant.device_constant import WorkMode
@@ -55,8 +59,9 @@ patches = _load_pymammotion_patches()
 patches.apply_pymammotion_patches()
 
 
-def test_upstream_081_mqtt_auth_and_rate_guards_are_kept() -> None:
-    """PyMammotion 0.8.1 native transport/auth fixes are not monkeypatched."""
+def test_upstream_mqtt_auth_sync_and_rate_guards_are_kept() -> None:
+    """PyMammotion native transport/auth/sync fixes are not monkeypatched."""
+    assert DeviceHandle._send_marked.__module__ == "pymammotion.device.handle"  # noqa: SLF001
     assert MQTTTransport.send.__module__ == "pymammotion.transport.mqtt"
     assert Transport.record_send.__module__ == "pymammotion.transport.base"
     assert (
@@ -264,12 +269,98 @@ def test_empty_v2_device_page_still_bootstraps_aliyun(
 
     assert any(event[0] == "connect_iot" for event in events)
     assert any(
-        event[:3] == ("register", "Yuka-YVFR8E9D", "aliyun-iot")
-        for event in events
+        event[:3] == ("register", "Yuka-YVFR8E9D", "aliyun-iot") for event in events
     )
     assert account_session.device_ids == {"Yuka-YVFR8E9D"}
     assert account_session.aliyun_transport is transport
     assert transport.connected is True
+
+
+def _aliyun_properties_envelope(generate_time_ms: int) -> bytes:
+    """Build a realistic Aliyun thing/properties envelope."""
+    return json.dumps(
+        {
+            "method": "thing.properties",
+            "id": "test-props-id",
+            "version": "1.0",
+            "params": {
+                "deviceType": "LawnMower",
+                "checkFailedData": {},
+                "groupIdList": [],
+                "_tenantId": "",
+                "groupId": "",
+                "categoryKey": "LawnMower",
+                "batchId": "",
+                "gmtCreate": generate_time_ms,
+                "productKey": "testpk",
+                "generateTime": generate_time_ms,
+                "deviceName": "testdn",
+                "_traceId": "",
+                "iotId": "test_iot_id",
+                "JMSXDeliveryCount": 1,
+                "checkLevel": 0,
+                "qos": 1,
+                "requestId": "1",
+                "_categoryKey": "TmallGenie.LawnMower",
+                "namespace": "",
+                "tenantId": "",
+                "thingType": "DEVICE",
+                "items": {
+                    "batteryPercentage": {
+                        "time": generate_time_ms,
+                        "value": 80,
+                    }
+                },
+                "tenantInstanceId": "",
+            },
+        }
+    ).encode()
+
+
+def _aliyun_transport_with_property_callback(events: list[Any]) -> Any:
+    """Build a minimal Aliyun transport object for dispatch tests."""
+    transport = AliyunMQTTTransport.__new__(AliyunMQTTTransport)
+    transport.on_device_event = None
+
+    async def on_properties(iot_id: str, message: object) -> None:
+        """Record dispatched property events."""
+        events.append((iot_id, message))
+
+    transport.on_device_properties = on_properties
+    return transport
+
+
+def test_stale_aliyun_properties_are_dropped_by_generate_time() -> None:
+    """Old Aliyun property snapshots must not overwrite current mower state."""
+    events: list[Any] = []
+    transport = _aliyun_transport_with_property_callback(events)
+    stale_time_ms = int(time.time() * 1000) - 120_000
+
+    asyncio.run(
+        transport._dispatch_aliyun_event(  # noqa: SLF001
+            "/sys/testpk/testdn/app/down/thing/properties",
+            _aliyun_properties_envelope(stale_time_ms),
+        )
+    )
+
+    assert events == []
+
+
+def test_fresh_aliyun_properties_are_forwarded() -> None:
+    """Fresh Aliyun property snapshots remain valid state updates."""
+    events: list[Any] = []
+    transport = _aliyun_transport_with_property_callback(events)
+    fresh_time_ms = int(time.time() * 1000) - 5_000
+
+    asyncio.run(
+        transport._dispatch_aliyun_event(  # noqa: SLF001
+            "/sys/testpk/testdn/app/down/thing/properties",
+            _aliyun_properties_envelope(fresh_time_ms),
+        )
+    )
+
+    assert len(events) == 1
+    assert events[0][0] == "test_iot_id"
 
 
 def _mower() -> MowerDevice:

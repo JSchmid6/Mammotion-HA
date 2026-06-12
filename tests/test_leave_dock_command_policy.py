@@ -164,7 +164,7 @@ def test_stale_report_keeps_cached_state_visible_after_first_report() -> None:
 
 
 def test_reported_offline_helper_uses_mqtt_offline_flag() -> None:
-    """True Mammotion offline semantics come from the handle availability flag."""
+    """True offline semantics require explicit MQTT offline and no live channel."""
     tree = _coordinator_tree()
     report = _class_def(tree, "MammotionReportUpdateCoordinator")
     helper = _method_def(report, "_device_reported_offline")
@@ -175,6 +175,7 @@ def test_reported_offline_helper_uses_mqtt_offline_flag() -> None:
     }
 
     assert "_has_usable_ble_transport" in _called_function_names(helper)
+    assert "mqtt_transport_connected" in attrs
     assert "mqtt_reported_offline" in attrs
 
 

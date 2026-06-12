@@ -130,6 +130,7 @@ MAP_INTERVAL = timedelta(minutes=60)
 RTK_INTERVAL = timedelta(hours=5)
 COMMAND_WARNING_LOG_INTERVAL = 900.0
 COMMAND_REPORT_SNAPSHOT_DELAY = 10.0
+MAP_SYNC_STATUSES = ("synced", "syncing", "out_of_sync")
 SEND_AND_WAIT_EXCEPTIONS = (
     *EXPIRED_CREDENTIAL_EXCEPTIONS,
     DeviceOfflineException,
@@ -328,11 +329,39 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
         handle = self.manager.mower(self.device_name)
         if handle is None:
             return bool(device.online)
-        return bool(handle.availability.is_available)
+        if handle.has_transport(TransportType.BLE) and (
+            ble := handle.get_transport(TransportType.BLE)
+        ):
+            if ble.is_usable:
+                return True
+        return self.mqtt_transport_connected or bool(handle.availability.is_available)
 
     def is_entity_available(self) -> bool:
         """Return True when HA entities should be shown as available."""
         return self.is_online()
+
+    @property
+    def mqtt_transport_connected(self) -> bool:
+        """Return True when a cloud MQTT transport is currently connected."""
+        handle = self.manager.mower(self.device_name)
+        if handle is None:
+            return False
+        for transport_type in (
+            TransportType.CLOUD_ALIYUN,
+            TransportType.CLOUD_MAMMOTION,
+        ):
+            if handle.is_transport_connected(transport_type):
+                return True
+        return False
+
+    @property
+    def mqtt_device_online(self) -> bool:
+        """Return True when Mammotion has not reported the mower offline over MQTT."""
+        handle = self.manager.mower(self.device_name)
+        if handle is not None:
+            return bool(not handle.availability.mqtt_reported_offline)
+        device = self.manager.get_device_by_name(self.device_name)
+        return bool(device.online) if device is not None else False
 
     def _command_failed_error(self) -> HomeAssistantError:
         """Build the standard command failure error for service callers."""
@@ -1600,6 +1629,23 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
 
         return name if name else f"area {area_hash}"
 
+    @property
+    def map_sync_status(self) -> str:
+        """Return whether the cached map is synced with the mower."""
+        handle = self.manager.mower(self.device_name)
+        if handle is not None and handle.queue.is_saga_active:
+            return "syncing"
+
+        if self.data is None:
+            return "out_of_sync"
+
+        mower_data = cast(MowingDevice, self.data)
+        locations = mower_data.report_data.locations
+        bol_hash = locations[0].bol_hash if locations else 0
+        if mower_data.map.is_map_synced(bol_hash):
+            return "synced"
+        return "out_of_sync"
+
 
 class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevice]):
     """Mammotion report update coordinator."""
@@ -1769,7 +1815,7 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
 
     def _device_reported_offline(self) -> bool:
         """Return True when Mammotion explicitly reported the mower offline."""
-        if self._has_usable_ble_transport():
+        if self._has_usable_ble_transport() or self.mqtt_transport_connected:
             return False
         device = self.manager.get_device_by_name(self.device_name)
         if device is not None and not device.online:

@@ -22,6 +22,8 @@ from pymammotion.data.model.report_info import ReportData
 from pymammotion.device.handle import DeviceHandle
 from pymammotion.device.state_reducer import MowerStateReducer
 from pymammotion.http.http import MammotionHTTP
+from pymammotion.transport import aliyun_mqtt as _aliyun_mqtt
+from pymammotion.transport.aliyun_mqtt import AliyunMQTTTransport
 from pymammotion.transport.base import (
     AuthError,
     LoginFailedError,
@@ -44,6 +46,7 @@ from .report_policy import (
 _SEND_MARKED_PATCH_ATTR = "_mammotion_ha_cloud_safe_send_marked"
 _START_REPORT_STREAM_PATCH_ATTR = "_mammotion_ha_job_watch_report_stream"
 _FORCED_REPORT_STREAM_PATCH_ATTR = "_mammotion_ha_forced_report_stream"
+_ALIYUN_STALE_PROPERTIES_PATCH_ATTR = "_mammotion_ha_aliyun_stale_properties_patch"
 _MQTT_PROTO_DISPATCH_PATCH_ATTR = "_mammotion_ha_mqtt_proto_dispatch_patch"
 _REPORT_PARTIAL_MERGE_PATCH_ATTR = "_mammotion_ha_report_partial_merge_patch"
 _REPORT_SANITY_PATCH_ATTR = "_mammotion_ha_report_sanity_patch"
@@ -58,6 +61,7 @@ _REPORT_SOURCE_CONTEXT: contextvars.ContextVar[dict[str, Any] | None] = (
 )
 
 _original_start_report_stream = DeviceHandle.start_report_stream
+_original_aliyun_dispatch_event = AliyunMQTTTransport._dispatch_aliyun_event  # noqa: SLF001
 _original_mqtt_dispatch = MQTTTransport._dispatch  # noqa: SLF001
 _original_report_data_update = ReportData.update
 _original_mower_state_apply = MowerStateReducer.apply
@@ -85,12 +89,14 @@ def _log_patch_warning(key: str, message: str, *args: object) -> None:
 
 
 def _send_marked_already_cloud_safe() -> bool:
-    """Return True when upstream already scopes BLE sync to BLE transports."""
+    """Return True when upstream send handling should be kept."""
     try:
         source = inspect.getsource(DeviceHandle._send_marked)  # noqa: SLF001
     except OSError, TypeError:
         return False
-    return "transport.transport_type is TransportType.BLE" in source
+    return "transport.transport_type is TransportType.BLE" in source or (
+        "send_mqtt_sync" in source and "_last_mqtt_sync_monotonic" in source
+    )
 
 
 async def _send_marked_cloud_safe(
@@ -228,6 +234,7 @@ def apply_pymammotion_patches() -> None:
     """Apply pymammotion compatibility patches once."""
     _patch_client_login()
     _patch_device_handle_send_and_streams()
+    _patch_aliyun_transport()
     _patch_mqtt_transport()
     _patch_report_reducer()
     _patch_raw_message_source()
@@ -274,6 +281,7 @@ async def _login_and_initiate_cloud_with_legacy_fallback(
             await mammotion_http.confirm_share(batch_id, record_ids)
 
     device_page_resp = await mammotion_http.get_user_device_page()
+    aliyun_devices = device_list_resp.data
     mammotion_records = (
         device_page_resp.data.records if device_page_resp.data else []
     ) or []
@@ -292,15 +300,24 @@ async def _login_and_initiate_cloud_with_legacy_fallback(
     )
     acct_session.user_account = self._extract_user_account(mammotion_http)  # noqa: SLF001
 
-    await _bootstrap_legacy_aliyun_if_needed(
-        self,
-        account,
-        mammotion_http,
-        acct_session,
-        owned_iot_id_map,
-        legacy_login_used=legacy_login_used,
-        mammotion_records=mammotion_records,
-    )
+    if aliyun_devices:
+        await _bootstrap_aliyun_devices(
+            self,
+            account,
+            mammotion_http,
+            acct_session,
+            owned_iot_id_map,
+        )
+    else:
+        await _bootstrap_legacy_aliyun_if_needed(
+            self,
+            account,
+            mammotion_http,
+            acct_session,
+            owned_iot_id_map,
+            legacy_login_used=legacy_login_used,
+            mammotion_records=mammotion_records,
+        )
 
     if mammotion_records:
         await self._bootstrap_mammotion_mqtt(  # noqa: SLF001
@@ -337,6 +354,61 @@ async def _login_mammotion_http_with_legacy_fallback(
         return legacy_resp, True
 
     return login_resp, False
+
+
+async def _bootstrap_aliyun_devices(
+    client: MammotionClient,
+    account: str,
+    mammotion_http: MammotionHTTP,
+    acct_session: AccountSession,
+    owned_iot_id_map: dict[str, str],
+) -> None:
+    """Register Aliyun devices using PyMammotion 0.8.5 cloud setup semantics."""
+    cloud_client = CloudIOTGateway(mammotion_http)
+    await client._connect_iot(cloud_client)  # noqa: SLF001
+    shared_notice = await cloud_client.get_shared_notice_list()
+    if shared_notice.data and shared_notice.data.data:
+        pending = [d.record_id for d in shared_notice.data.data if d.status == -1]
+        if pending:
+            await cloud_client.confirm_share(pending)
+
+    if cloud_client.aep_response is None or cloud_client.region_response is None:
+        msg = "Aliyun setup incomplete - aep_response or region_response missing"
+        raise RuntimeError(msg)
+    if (
+        cloud_client.session_by_authcode_response is None
+        or cloud_client.session_by_authcode_response.data is None
+    ):
+        msg = "Aliyun setup incomplete - session_by_authcode_response.data missing"
+        raise RuntimeError(msg)
+
+    acct_session.cloud_client = cloud_client
+    acct_session.token_manager = TokenManager(account, mammotion_http, cloud_client)
+    acct_session.token_manager.on_credentials_updated = _credentials_update_callback(
+        client
+    )
+    al_transport = client._setup_aliyun_transport(cloud_client, acct_session)  # noqa: SLF001
+    acct_session.aliyun_transport = al_transport
+    user_account = acct_session.user_account
+
+    device_response = cloud_client.devices_by_account_response
+    devices = (
+        device_response.data.data if device_response and device_response.data else []
+    )
+    for device in devices:
+        if not device.device_name:
+            continue
+        iot_id = owned_iot_id_map.get(device.device_name) or device.iot_id
+        await client._register_aliyun_device(  # noqa: SLF001
+            device.device_name,
+            iot_id,
+            al_transport,
+            user_account,
+            device.product_key,
+            token_manager=acct_session.token_manager,
+        )
+        acct_session.device_ids.add(device.device_name)
+    await al_transport.connect()
 
 
 async def _bootstrap_legacy_aliyun_if_needed(
@@ -394,13 +466,17 @@ async def _bootstrap_legacy_aliyun_if_needed(
 
     acct_session.cloud_client = cloud_client
     acct_session.token_manager = TokenManager(account, mammotion_http, cloud_client)
-    acct_session.token_manager.on_credentials_updated = client.on_credentials_updated
+    acct_session.token_manager.on_credentials_updated = _credentials_update_callback(
+        client
+    )
     al_transport = client._setup_aliyun_transport(cloud_client, acct_session)  # noqa: SLF001
     acct_session.aliyun_transport = al_transport
     user_account = acct_session.user_account
 
     device_response = cloud_client.devices_by_account_response
-    devices = device_response.data.data if device_response and device_response.data else []
+    devices = (
+        device_response.data.data if device_response and device_response.data else []
+    )
     for device in devices:
         if not device.device_name:
             continue
@@ -415,6 +491,15 @@ async def _bootstrap_legacy_aliyun_if_needed(
         )
         acct_session.device_ids.add(device.device_name)
     await al_transport.connect()
+
+
+def _credentials_update_callback(client: MammotionClient) -> Any:
+    """Return PyMammotion's current credentials-update callback name."""
+    return getattr(
+        client,
+        "_on_credentials_updated",
+        getattr(client, "on_credentials_updated", None),
+    )
 
 
 def _redacted_account(account: str) -> str:
@@ -444,6 +529,71 @@ def _patch_device_handle_send_and_streams() -> None:
     if not getattr(DeviceHandle, _FORCED_REPORT_STREAM_PATCH_ATTR, False):
         setattr(DeviceHandle, "start_forced_report_stream", _start_forced_report_stream)
         setattr(DeviceHandle, _FORCED_REPORT_STREAM_PATCH_ATTR, True)
+
+
+def _patch_aliyun_transport() -> None:
+    """Patch stale Aliyun property filtering until PyMammotion releases it."""
+    if not _aliyun_stale_property_filter_present() and not getattr(
+        AliyunMQTTTransport, _ALIYUN_STALE_PROPERTIES_PATCH_ATTR, False
+    ):
+        setattr(
+            AliyunMQTTTransport,
+            "_dispatch_aliyun_event",
+            _dispatch_aliyun_event_with_property_staleness,
+        )
+        setattr(AliyunMQTTTransport, _ALIYUN_STALE_PROPERTIES_PATCH_ATTR, True)
+
+
+def _aliyun_stale_property_filter_present() -> bool:
+    """Return True when upstream filters properties via generateTime/gmtCreate."""
+    try:
+        source = inspect.getsource(AliyunMQTTTransport._dispatch_aliyun_event)  # noqa: SLF001
+    except OSError, TypeError:
+        return False
+    return "generateTime" in source and "gmtCreate" in source
+
+
+async def _dispatch_aliyun_event_with_property_staleness(
+    self: AliyunMQTTTransport,
+    topic: str,
+    raw: bytes,
+) -> None:
+    """Drop stale thing/properties envelopes before PyMammotion reduces them."""
+    if topic.endswith("/thing/properties") and _is_stale_aliyun_properties(raw):
+        _LOGGER.debug(
+            "AliyunMQTTTransport: dropping stale thing/properties event before "
+            "state reduction"
+        )
+        return
+    await _original_aliyun_dispatch_event(self, topic, raw)
+
+
+def _is_stale_aliyun_properties(raw: bytes) -> bool:
+    """Return True when an Aliyun properties envelope is too old to trust."""
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError, UnicodeDecodeError, ValueError:
+        return False
+
+    params = parsed.get("params")
+    if not isinstance(params, dict):
+        return False
+
+    try:
+        envelope_time_ms = int(
+            params.get("time")
+            or params.get("generateTime")
+            or params.get("gmtCreate")
+            or 0
+        )
+    except TypeError, ValueError:
+        return False
+    if envelope_time_ms <= 0:
+        return False
+
+    threshold_ms = getattr(_aliyun_mqtt, "_STALE_EVENT_THRESHOLD_MS", 60_000)
+    age_ms = int(time.time() * 1000) - envelope_time_ms
+    return age_ms > threshold_ms
 
 
 def _patch_mqtt_transport() -> None:
