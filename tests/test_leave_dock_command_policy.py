@@ -134,6 +134,76 @@ def test_command_report_watch_schedules_delayed_snapshot() -> None:
     )
 
 
+def test_command_report_watch_schedules_bounded_snapshot_retries() -> None:
+    """Command report watches should schedule a small fixed retry set."""
+    tree = _coordinator_tree()
+    constants = _constant_values(tree)
+
+    assert "COMMAND_REPORT_SNAPSHOT_DELAYS" in {
+        node.id for node in ast.walk(tree) if isinstance(node, ast.Name)
+    }
+    assert 2.0 in constants
+    assert 10.0 in constants
+    assert 25.0 in constants
+
+
+def test_send_command_starts_post_command_report_refresh() -> None:
+    """Successful queued commands should start the centralized report refresh."""
+    tree = _coordinator_tree()
+    base = _class_def(tree, "MammotionBaseUpdateCoordinator")
+    send_command = _async_method_def(base, "async_send_command")
+    calls = _called_function_names(send_command)
+
+    assert "_async_start_post_command_report_refresh" in calls
+
+
+def test_send_and_wait_starts_post_command_report_refresh() -> None:
+    """Successful ACK-based commands should start the centralized report refresh."""
+    tree = _coordinator_tree()
+    base = _class_def(tree, "MammotionBaseUpdateCoordinator")
+    send_and_wait = _async_method_def(base, "async_send_and_wait")
+    calls = _called_function_names(send_and_wait)
+
+    assert "_async_start_post_command_report_refresh" in calls
+
+
+def test_post_command_refresh_policy_skips_read_commands() -> None:
+    """Read-only Mammotion commands must not self-amplify report polling."""
+    tree = _coordinator_tree()
+    base = _class_def(tree, "MammotionBaseUpdateCoordinator")
+    policy = _method_def(base, "_should_refresh_report_after_command")
+    constants = _constant_values(policy)
+    calls = _called_function_names(policy)
+
+    assert "POST_COMMAND_REPORT_READ_ONLY_COMMANDS" in {
+        node.id for node in ast.walk(policy) if isinstance(node, ast.Name)
+    }
+    assert "POST_COMMAND_REPORT_READ_ONLY_PREFIXES" in {
+        node.id for node in ast.walk(policy) if isinstance(node, ast.Name)
+    }
+    assert "read_write_device" in constants
+    assert "read_and_set_sidelight" in constants
+    assert "startswith" in calls
+
+
+def test_post_command_refresh_policy_includes_transition_commands() -> None:
+    """Robot transition commands should be followed by a report watch."""
+    tree = _coordinator_tree()
+    constants = _constant_values(tree)
+
+    for command in (
+        "leave_dock",
+        "single_schedule",
+        "start_job",
+        "return_to_dock",
+        "pause_execute_task",
+        "cancel_return_to_dock",
+        "resume_execute_task",
+        "cancel_job",
+    ):
+        assert command in constants
+
+
 def test_report_availability_uses_fresh_report_before_transport_state() -> None:
     """Fresh telemetry should keep HA state visible through transport flaps."""
     tree = _coordinator_tree()
