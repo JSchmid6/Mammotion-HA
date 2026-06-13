@@ -98,6 +98,21 @@ def test_dock_waits_for_task_ack_and_starts_report_watch() -> None:
     assert "todev_taskctrl_ack" in constants
 
 
+def test_task_start_queues_single_schedule_without_wrong_plan_ack() -> None:
+    """Single-run task starts must not wait for the plan-list ACK."""
+    tree = _coordinator_tree()
+    base = _class_def(tree, "MammotionBaseUpdateCoordinator")
+    start_task = _async_method_def(base, "start_task")
+    calls = _called_function_names(start_task)
+    constants = _constant_values(start_task)
+
+    assert "async_send_command" in calls
+    assert "async_start_command_report_watch" in calls
+    assert "async_send_and_wait" not in calls
+    assert "single_schedule" in constants
+    assert "todev_planjob_set" not in constants
+
+
 def test_command_report_watch_schedules_delayed_snapshot() -> None:
     """Command report watches also request a short delayed fresh snapshot."""
     tree = _coordinator_tree()
@@ -168,11 +183,7 @@ def test_reported_offline_helper_uses_mqtt_offline_flag() -> None:
     tree = _coordinator_tree()
     report = _class_def(tree, "MammotionReportUpdateCoordinator")
     helper = _method_def(report, "_device_reported_offline")
-    attrs = {
-        attr.attr
-        for attr in ast.walk(helper)
-        if isinstance(attr, ast.Attribute)
-    }
+    attrs = {attr.attr for attr in ast.walk(helper) if isinstance(attr, ast.Attribute)}
 
     assert "_has_usable_ble_transport" in _called_function_names(helper)
     assert "mqtt_transport_connected" in attrs
@@ -214,17 +225,11 @@ def test_availability_probe_has_failure_backoff() -> None:
     report = _class_def(tree, "MammotionReportUpdateCoordinator")
     probe = _async_method_def(report, "_async_probe_stale_report_if_needed")
     calls = _called_function_names(probe)
-    names = {
-        node.id
-        for node in ast.walk(probe)
-        if isinstance(node, ast.Name)
-    }
+    names = {node.id for node in ast.walk(probe) if isinstance(node, ast.Name)}
 
     assert "_schedule_next_availability_probe" in calls
     assert "_availability_probe_backoff_seconds" in calls
     assert "_availability_probe_failures" in {
-        attr.attr
-        for attr in ast.walk(probe)
-        if isinstance(attr, ast.Attribute)
+        attr.attr for attr in ast.walk(probe) if isinstance(attr, ast.Attribute)
     }
     assert "REPORT_AVAILABILITY_PROBE_MIN_INTERVAL" in names
