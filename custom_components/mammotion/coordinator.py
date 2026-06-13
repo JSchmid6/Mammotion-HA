@@ -130,6 +130,39 @@ MAP_INTERVAL = timedelta(minutes=60)
 RTK_INTERVAL = timedelta(hours=5)
 COMMAND_WARNING_LOG_INTERVAL = 900.0
 COMMAND_REPORT_SNAPSHOT_DELAY = 10.0
+COMMAND_REPORT_SNAPSHOT_DELAYS: tuple[float, ...] = (
+    2.0,
+    COMMAND_REPORT_SNAPSHOT_DELAY,
+    25.0,
+)
+POST_COMMAND_REPORT_READ_ONLY_PREFIXES = ("get_", "query_", "read_")
+POST_COMMAND_REPORT_READ_ONLY_COMMANDS = frozenset(
+    {
+        "basestation_info",
+        "get_area_name_list",
+        "get_cutter_mode",
+        "get_device_network_info",
+        "get_maintenance",
+        "read_plan",
+        "send_svg_data",
+    }
+)
+POST_COMMAND_REPORT_ALWAYS_COMMANDS = frozenset(
+    {
+        "cancel_job",
+        "cancel_return_to_dock",
+        "leave_dock",
+        "modify_route_information",
+        "operate_on_device",
+        "pause_execute_task",
+        "remote_restart",
+        "resume_execute_task",
+        "return_to_dock",
+        "set_blade_control",
+        "single_schedule",
+        "start_job",
+    }
+)
 MAP_SYNC_STATUSES = ("synced", "syncing", "out_of_sync")
 SEND_AND_WAIT_EXCEPTIONS = (
     *EXPIRED_CREDENTIAL_EXCEPTIONS,
@@ -518,6 +551,7 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
             return None
         self._raise_for_command_result(command, expected_field, response)
         self.update_failures = 0
+        await self._async_start_post_command_report_refresh(command, kwargs)
         return response
 
     async def _async_handle_send_and_wait_exception(
@@ -679,6 +713,31 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
                     return candidate
         return None
 
+    async def _async_start_post_command_report_refresh(
+        self,
+        command: str,
+        command_kwargs: Mapping[str, Any],
+    ) -> None:
+        """Start a bounded status refresh after commands that may change state."""
+        if self._should_refresh_report_after_command(command, command_kwargs):
+            await self.async_start_command_report_watch(command)
+
+    def _should_refresh_report_after_command(
+        self,
+        command: str,
+        command_kwargs: Mapping[str, Any],
+    ) -> bool:
+        """Return True when a successful command should be followed by reports."""
+        if command in POST_COMMAND_REPORT_ALWAYS_COMMANDS:
+            return True
+        if command in POST_COMMAND_REPORT_READ_ONLY_COMMANDS:
+            return False
+        if command == "read_write_device":
+            return _int_or_none(command_kwargs.get("rw")) == 1
+        if command == "read_and_set_sidelight":
+            return _int_or_none(command_kwargs.get("operate")) == 0
+        return not command.startswith(POST_COMMAND_REPORT_READ_ONLY_PREFIXES)
+
     @staticmethod
     def device_offline(device: MowingDevice | RTKBaseStationDevice) -> None:
         """Mark the device as offline in its state model."""
@@ -705,15 +764,15 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
         if device is None or not self.is_online():
             return False
 
+        command_kwargs = dict(kwargs)
+        prefer_ble = command_kwargs.pop("prefer_ble", self._bluetooth_enabled)
         try:
             await self.manager.send_command_with_args(
                 self.device_name,
                 command,
-                prefer_ble=kwargs.pop("prefer_ble", self._bluetooth_enabled),
-                **kwargs,
+                prefer_ble=prefer_ble,
+                **command_kwargs,
             )
-            self.update_failures = 0
-            return True
         except FailedRequestException as exc:
             self._log_command_warning(
                 "failed-request",
@@ -767,6 +826,13 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
             raise HomeAssistantError(
                 translation_domain=DOMAIN, translation_key="command_failed"
             ) from exc
+        else:
+            self.update_failures = 0
+            await self._async_start_post_command_report_refresh(
+                command,
+                command_kwargs,
+            )
+            return True
         return False
 
     async def async_send_cloud_command(
@@ -2227,29 +2293,38 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         self._dock_access_poll_unsub = None
 
     def _schedule_command_report_snapshot_refresh(self, reason: str) -> None:
-        """Request a prioritized snapshot shortly after a command transition."""
-        unsub_holder: list[CALLBACK_TYPE] = []
+        """Request prioritized snapshots shortly after a command transition."""
+        self._cancel_command_report_snapshot_refreshes()
 
-        @callback
-        def _handle_command_report_snapshot(_: datetime.datetime) -> None:
-            if unsub_holder:
-                unsub = unsub_holder.pop()
-                if unsub in self._command_report_snapshot_unsubs:
-                    self._command_report_snapshot_unsubs.remove(unsub)
-            self.hass.async_create_task(
-                self._async_request_report_snapshot_guarded(
-                    priority=True,
-                    reason=f"{reason} command follow-up",
+        for delay in COMMAND_REPORT_SNAPSHOT_DELAYS:
+            unsub_holder: list[CALLBACK_TYPE] = []
+
+            @callback
+            def _handle_command_report_snapshot(
+                _: datetime.datetime,
+                scheduled_delay: float = delay,
+                holder: list[CALLBACK_TYPE] = unsub_holder,
+            ) -> None:
+                if holder:
+                    unsub = holder.pop()
+                    if unsub in self._command_report_snapshot_unsubs:
+                        self._command_report_snapshot_unsubs.remove(unsub)
+                if not self._command_report_watch_active():
+                    return
+                self.hass.async_create_task(
+                    self._async_request_report_snapshot_guarded(
+                        priority=True,
+                        reason=(f"{reason} command follow-up {scheduled_delay:g}s"),
+                    )
                 )
-            )
 
-        unsub = async_call_later(
-            self.hass,
-            COMMAND_REPORT_SNAPSHOT_DELAY,
-            _handle_command_report_snapshot,
-        )
-        unsub_holder.append(unsub)
-        self._command_report_snapshot_unsubs.append(unsub)
+            unsub = async_call_later(
+                self.hass,
+                delay,
+                _handle_command_report_snapshot,
+            )
+            unsub_holder.append(unsub)
+            self._command_report_snapshot_unsubs.append(unsub)
 
     def _cancel_command_report_snapshot_refreshes(self) -> None:
         """Cancel delayed command report refresh callbacks."""
