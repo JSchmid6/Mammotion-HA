@@ -1387,13 +1387,15 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
 
     async def start_task(self, plan_id: str) -> None:
         """Start task."""
-        await self.async_send_and_wait(
-            "single_schedule",
-            "todev_planjob_set",
-            plan_id=plan_id,
-            raise_on_failure=True,
-            require_fresh_report=True,
-        )
+        sent = await self.async_send_command("single_schedule", plan_id=plan_id)
+        if sent is not True:
+            self._log_command_warning(
+                "task-start-not-sent",
+                "Mammotion task start command for %s could not be queued",
+                self.device_name,
+            )
+            raise self._command_failed_error()
+
         await self.async_start_command_report_watch("single_schedule")
 
     async def async_restart_mower(self) -> None:
@@ -1922,8 +1924,9 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         if now < self._next_availability_probe_at:
             return
 
-        if not self._has_usable_ble_transport() and not self._cloud_snapshot_budget_allows(
-            priority=True
+        if (
+            not self._has_usable_ble_transport()
+            and not self._cloud_snapshot_budget_allows(priority=True)
         ):
             self._schedule_next_availability_probe(
                 now,
