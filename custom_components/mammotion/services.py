@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Any
 
 import voluptuous as vol
@@ -25,15 +26,18 @@ DEFAULT_REPORT_STREAM_DURATION_SECONDS = 300
 MAX_REPORT_STREAM_DURATION_SECONDS = 1800
 MIN_REPORT_STREAM_DURATION_SECONDS = 10
 
+ENTITY_IDS_SCHEMA = vol.All(cv.entity_ids, vol.Length(min=1))
+SINGLE_ENTITY_ID_SCHEMA = vol.All(cv.entity_ids, vol.Length(min=1, max=1))
+
 GEOJSON_SCHEMA = vol.Schema(
-    {vol.Required(ATTR_ENTITY_ID): cv.entity_id}, extra=vol.ALLOW_EXTRA
+    {vol.Required(ATTR_ENTITY_ID): SINGLE_ENTITY_ID_SCHEMA}, extra=vol.ALLOW_EXTRA
 )
 REPORT_SCHEMA = vol.Schema(
-    {vol.Required(ATTR_ENTITY_ID): cv.entity_id}, extra=vol.ALLOW_EXTRA
+    {vol.Required(ATTR_ENTITY_ID): ENTITY_IDS_SCHEMA}, extra=vol.ALLOW_EXTRA
 )
 REPORT_STREAM_SCHEMA = vol.Schema(
     {
-        vol.Required(ATTR_ENTITY_ID): cv.entity_id,
+        vol.Required(ATTR_ENTITY_ID): ENTITY_IDS_SCHEMA,
         vol.Optional(
             ATTR_DURATION_SECONDS,
             default=DEFAULT_REPORT_STREAM_DURATION_SECONDS,
@@ -47,6 +51,14 @@ REPORT_STREAM_SCHEMA = vol.Schema(
     },
     extra=vol.ALLOW_EXTRA,
 )
+
+
+def _entity_ids_from_call(call: ServiceCall) -> list[str]:
+    """Return entity ids from a service call after HA target validation."""
+    entity_ids = call.data[ATTR_ENTITY_ID]
+    if isinstance(entity_ids, str):
+        return [entity_ids]
+    return list(entity_ids)
 
 
 def _get_mower_by_entity_id(
@@ -80,92 +92,121 @@ def _get_mower_by_entity_id(
     return None
 
 
+def _get_mowers_from_call(
+    hass: HomeAssistant, call: ServiceCall
+) -> list[MammotionMowerData]:
+    """Return all mower data objects referenced by a service call."""
+    mowers: list[MammotionMowerData] = []
+    for entity_id in _entity_ids_from_call(call):
+        mower = _get_mower_by_entity_id(hass, entity_id)
+        if mower is None:
+            LOGGER.error("Could not find entity %s", entity_id)
+            continue
+        mowers.append(mower)
+    return mowers
+
+
+def _get_single_mower_from_call(
+    hass: HomeAssistant, call: ServiceCall
+) -> MammotionMowerData | None:
+    """Return the single mower referenced by a response-oriented service call."""
+    entity_ids = _entity_ids_from_call(call)
+    if len(entity_ids) != 1:
+        LOGGER.error("Expected exactly one entity_id, got %s", entity_ids)
+        return None
+    return _get_mower_by_entity_id(hass, entity_ids[0])
+
+
+async def _handle_request_report(hass: HomeAssistant, call: ServiceCall) -> None:
+    """Request one report snapshot for every referenced mower."""
+    for mower in _get_mowers_from_call(hass, call):
+        await mower.reporting_coordinator.async_request_report_snapshot()
+
+
+async def _handle_start_report_stream(hass: HomeAssistant, call: ServiceCall) -> None:
+    """Start a temporary report stream for every referenced mower."""
+    duration_ms = call.data[ATTR_DURATION_SECONDS] * 1000
+    for mower in _get_mowers_from_call(hass, call):
+        await mower.reporting_coordinator.async_start_report_stream(duration_ms)
+
+
+async def _handle_get_geojson(hass: HomeAssistant, call: ServiceCall) -> dict[str, Any]:
+    """Return the generated map GeoJSON for one mower."""
+    mower = _get_single_mower_from_call(hass, call)
+    if mower is None:
+        return {}
+    coordinator = mower.reporting_coordinator
+    await coordinator.async_start_report_stream(duration_ms=300_000)
+    return apply_geojson_offset(
+        coordinator.data.map.generated_geojson,
+        coordinator.map_offset_lat,
+        coordinator.map_offset_lon,
+    )
+
+
+async def _handle_get_mow_path_geojson(
+    hass: HomeAssistant, call: ServiceCall
+) -> dict[str, Any]:
+    """Return the generated mow path GeoJSON for one mower."""
+    mower = _get_single_mower_from_call(hass, call)
+    if mower is None:
+        return {}
+    coordinator = mower.reporting_coordinator
+    return apply_geojson_offset(
+        coordinator.data.map.generated_mow_path_geojson,
+        coordinator.map_offset_lat,
+        coordinator.map_offset_lon,
+    )
+
+
+async def _handle_get_mow_progress_geojson(
+    hass: HomeAssistant, call: ServiceCall
+) -> dict[str, Any]:
+    """Return the generated mow progress GeoJSON for one mower."""
+    mower = _get_single_mower_from_call(hass, call)
+    if mower is None:
+        return {}
+    coordinator = mower.reporting_coordinator
+    return apply_geojson_offset(
+        coordinator.data.map.generated_mow_progress_geojson,
+        coordinator.map_offset_lat,
+        coordinator.map_offset_lon,
+    )
+
+
 @callback
 def async_setup_services(hass: HomeAssistant) -> None:
     """Register Mammotion services."""
-
-    async def handle_request_report(call: ServiceCall) -> None:
-        mower = _get_mower_by_entity_id(hass, call.data[ATTR_ENTITY_ID])
-        if mower is None:
-            LOGGER.error("Could not find entity %s", call.data[ATTR_ENTITY_ID])
-            return
-        await mower.reporting_coordinator.async_request_report_snapshot()
-
-    async def handle_start_report_stream(call: ServiceCall) -> None:
-        mower = _get_mower_by_entity_id(hass, call.data[ATTR_ENTITY_ID])
-        if mower is None:
-            LOGGER.error("Could not find entity %s", call.data[ATTR_ENTITY_ID])
-            return
-        duration_ms = call.data[ATTR_DURATION_SECONDS] * 1000
-        await mower.reporting_coordinator.async_start_report_stream(duration_ms)
-
-    async def handle_get_geojson(call: ServiceCall) -> dict[str, Any]:
-        mower = _get_mower_by_entity_id(hass, call.data[ATTR_ENTITY_ID])
-        if mower is None:
-            LOGGER.error("Could not find entity %s", call.data[ATTR_ENTITY_ID])
-            return {}
-        coordinator = mower.reporting_coordinator
-        await coordinator.async_start_report_stream(duration_ms=300_000)
-        return apply_geojson_offset(
-            coordinator.data.map.generated_geojson,
-            coordinator.map_offset_lat,
-            coordinator.map_offset_lon,
-        )
-
-    async def handle_get_mow_path_geojson(call: ServiceCall) -> dict[str, Any]:
-        mower = _get_mower_by_entity_id(hass, call.data[ATTR_ENTITY_ID])
-        if mower is None:
-            LOGGER.error("Could not find entity %s", call.data[ATTR_ENTITY_ID])
-            return {}
-        coordinator = mower.reporting_coordinator
-        return apply_geojson_offset(
-            coordinator.data.map.generated_mow_path_geojson,
-            coordinator.map_offset_lat,
-            coordinator.map_offset_lon,
-        )
-
-    async def handle_get_mow_progress_geojson(call: ServiceCall) -> dict[str, Any]:
-        mower = _get_mower_by_entity_id(hass, call.data[ATTR_ENTITY_ID])
-        if mower is None:
-            LOGGER.error("Could not find entity %s", call.data[ATTR_ENTITY_ID])
-            return {}
-        coordinator = mower.reporting_coordinator
-        return apply_geojson_offset(
-            coordinator.data.map.generated_mow_progress_geojson,
-            coordinator.map_offset_lat,
-            coordinator.map_offset_lon,
-        )
-
     hass.services.async_register(
         DOMAIN,
         SERVICE_REQUEST_REPORT,
-        handle_request_report,
+        partial(_handle_request_report, hass),
         schema=REPORT_SCHEMA,
     )
     hass.services.async_register(
         DOMAIN,
         SERVICE_START_REPORT_STREAM,
-        handle_start_report_stream,
+        partial(_handle_start_report_stream, hass),
         schema=REPORT_STREAM_SCHEMA,
     )
     hass.services.async_register(
         DOMAIN,
         SERVICE_GET_GEOJSON,
-        handle_get_geojson,
+        partial(_handle_get_geojson, hass),
         schema=GEOJSON_SCHEMA,
         supports_response=SupportsResponse.ONLY,
     )
     hass.services.async_register(
         DOMAIN,
         SERVICE_GET_MOW_PATH_GEOJSON,
-        handle_get_mow_path_geojson,
+        partial(_handle_get_mow_path_geojson, hass),
         schema=GEOJSON_SCHEMA,
         supports_response=SupportsResponse.ONLY,
     )
     hass.services.async_register(
         DOMAIN,
         SERVICE_GET_MOW_PROGRESS_GEOJSON,
-        handle_get_mow_progress_geojson,
+        partial(_handle_get_mow_progress_geojson, hass),
         schema=GEOJSON_SCHEMA,
         supports_response=SupportsResponse.ONLY,
     )
