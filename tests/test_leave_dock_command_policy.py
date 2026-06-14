@@ -129,9 +129,38 @@ def test_command_report_watch_schedules_delayed_snapshot() -> None:
         start_watch
     )
     assert "async_call_later" in _called_function_names(schedule_refresh)
-    assert "_async_request_report_snapshot_guarded" in _called_function_names(
+    assert "_async_request_command_report_refresh" in _called_function_names(
         schedule_refresh
     )
+
+
+def test_command_report_watch_requests_full_report_cfg() -> None:
+    """Command watches should nudge the legacy full report path too."""
+    tree = _coordinator_tree()
+    report = _class_def(tree, "MammotionReportUpdateCoordinator")
+    start_watch = _async_method_def(report, "async_start_command_report_watch")
+    schedule_refresh = next(
+        node
+        for node in report.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_schedule_command_report_snapshot_refresh"
+    )
+
+    assert "_async_request_report_cfg_guarded" in _called_function_names(start_watch)
+    assert "_async_request_command_report_refresh" in _called_function_names(
+        schedule_refresh
+    )
+
+
+def test_report_cfg_helper_uses_device_handle_request_report_cfg() -> None:
+    """The full report refresh should use PyMammotion's report_cfg helper."""
+    tree = _coordinator_tree()
+    base = _class_def(tree, "MammotionBaseUpdateCoordinator")
+    report_cfg = _async_method_def(base, "async_request_report_cfg")
+    calls = _called_function_names(report_cfg)
+
+    assert "mower" in calls
+    assert "request_report_cfg" in _constant_values(report_cfg)
 
 
 def test_command_report_watch_schedules_bounded_snapshot_retries() -> None:

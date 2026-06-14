@@ -1343,6 +1343,16 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
         """Fire a one-shot count=1 snapshot; no-op while BLE stream is active."""
         await self.manager.request_report_snapshot(self.device_name)
 
+    async def async_request_report_cfg(self, *, dedup_key: str = "report_cfg") -> None:
+        """Request the full legacy report config refresh when supported."""
+        handle = self.manager.mower(self.device_name)
+        if handle is None:
+            return
+        request_report_cfg = getattr(handle, "request_report_cfg", None)
+        if request_report_cfg is None:
+            return
+        await request_report_cfg(dedup_key=dedup_key)
+
     async def async_start_report_stream(self, duration_ms: int = 300_000) -> None:
         """Start a transient continuous report window via the library."""
         await self.manager.start_report_stream(self.device_name, duration_ms)
@@ -2064,6 +2074,10 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
                 self.device_name,
                 reason,
             )
+        await self._async_request_report_cfg_guarded(
+            priority=True,
+            reason=f"{reason} command immediate",
+        )
         self._schedule_command_report_snapshot_refresh(reason)
 
     def _has_usable_ble_transport(self) -> bool:
@@ -2312,9 +2326,8 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
                 if not self._command_report_watch_active():
                     return
                 self.hass.async_create_task(
-                    self._async_request_report_snapshot_guarded(
-                        priority=True,
-                        reason=(f"{reason} command follow-up {scheduled_delay:g}s"),
+                    self._async_request_command_report_refresh(
+                        reason=f"{reason} command follow-up {scheduled_delay:g}s",
                     )
                 )
 
@@ -2612,6 +2625,47 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
             return
 
         self._last_cloud_snapshot_at = now
+
+    async def _async_request_report_cfg_guarded(
+        self, *, priority: bool = False, reason: str
+    ) -> None:
+        """Request a full report config refresh during bounded command watches."""
+        if not self._has_usable_ble_transport():
+            if not self.is_online() or not self._cloud_snapshot_budget_allows(
+                priority=priority
+            ):
+                return
+
+        try:
+            await self.async_request_report_cfg(
+                dedup_key=f"command_report_cfg:{reason}"
+            )
+        except (
+            DeviceOfflineException,
+            NoTransportAvailableError,
+            TransportRateLimitedError,
+            TooManyRequestsException,
+        ) as exc:
+            self._log_cloud_snapshot_failure(reason, exc)
+            return
+
+        self._last_cloud_snapshot_at = time.monotonic()
+        LOGGER.info(
+            "report-coordinator [%s]: full report cfg requested for %s",
+            self.device_name,
+            reason,
+        )
+
+    async def _async_request_command_report_refresh(self, reason: str) -> None:
+        """Run the bounded post-command report refresh pair."""
+        await self._async_request_report_snapshot_guarded(
+            priority=True,
+            reason=reason,
+        )
+        await self._async_request_report_cfg_guarded(
+            priority=True,
+            reason=reason,
+        )
 
     async def _async_update_data(self) -> MowingDevice:
         """Get data from the device."""
