@@ -85,6 +85,16 @@ def test_report_services_use_centralized_entity_list_normalization() -> None:
         assert "_get_mower_by_entity_id" not in calls
 
 
+def test_request_report_service_uses_full_report_refresh() -> None:
+    """Manual report requests should use the strongest available report nudge."""
+    tree = _services_tree()
+    handler = _async_function_def(tree, "_handle_request_report")
+    calls = _called_function_names(handler)
+
+    assert "async_request_report_refresh" in calls
+    assert "async_request_report_snapshot" not in calls
+
+
 def test_response_services_require_single_normalized_entity() -> None:
     """GeoJSON response services should normalize target lists to one mower."""
     tree = _services_tree()
