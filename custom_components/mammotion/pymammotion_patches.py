@@ -657,28 +657,42 @@ def _report_data_update_preserve_partial_state(self: ReportData, data: Any) -> N
     previous_dev = deepcopy(self.dev) if data.dev is not None else None
     previous_connect = deepcopy(self.connect) if data.connect is not None else None
     previous_work = deepcopy(self.work) if data.work is not None else None
+    previous_locations = deepcopy(self.locations) if data.dev is not None else None
 
     _original_report_data_update(self, data)
 
     if previous_dev is not None:
         self.dev = _merge_model_update(previous_dev, data.dev)
-        _normalize_partial_dev_update(self.dev, data.dev)
+        _normalize_partial_dev_update(
+            self.dev,
+            data.dev,
+            report_update=data,
+            previous_locations=previous_locations,
+        )
     if previous_connect is not None:
         self.connect = _merge_model_update(previous_connect, data.connect)
     if previous_work is not None:
         self.work = _merge_model_update(previous_work, data.work)
 
 
-def _normalize_partial_dev_update(dev: Any, proto_update: Any) -> None:
+def _normalize_partial_dev_update(
+    dev: Any,
+    proto_update: Any,
+    *,
+    report_update: Any | None = None,
+    previous_locations: Any | None = None,
+) -> None:
     """Keep preserved dev fields compatible with an explicit status update."""
     incoming = proto_update.to_dict(casing=betterproto2.Casing.SNAKE)
     if "sys_status" not in incoming or "charge_state" in incoming:
         return
 
-    if incoming["sys_status"] not in {
-        int(WorkMode.MODE_WORKING),
-        int(WorkMode.MODE_RETURNING),
-    }:
+    clear_reason = _partial_charge_state_clear_reason(
+        incoming,
+        report_update=report_update,
+        previous_locations=previous_locations,
+    )
+    if clear_reason is None:
         return
 
     if getattr(dev, "charge_state", 0) == 0:
@@ -688,15 +702,78 @@ def _normalize_partial_dev_update(dev: Any, proto_update: Any) -> None:
         "partial-report-active-charge-clear",
         (
             "pymammotion report reducer cleared stale charge_state after "
-            "active sys_status without charge_state: sys_status=%s; "
-            "previous_charge_state=%s; source=%s; incoming_dev=%s"
+            "partial sys_status without charge_state: reason=%s; "
+            "sys_status=%s; previous_charge_state=%s; source=%s; incoming_dev=%s"
         ),
+        clear_reason,
         incoming["sys_status"],
         getattr(dev, "charge_state", None),
         _current_report_source(),
         incoming,
     )
     dev.charge_state = 0
+
+
+def _partial_charge_state_clear_reason(
+    incoming: dict[str, Any],
+    *,
+    report_update: Any | None,
+    previous_locations: Any | None,
+) -> str | None:
+    """Return why an absent charge_state should clear a preserved charging flag."""
+    sys_status = incoming["sys_status"]
+    if sys_status in {
+        int(WorkMode.MODE_WORKING),
+        int(WorkMode.MODE_RETURNING),
+    }:
+        return "active_status"
+
+    if sys_status != int(WorkMode.MODE_READY):
+        return None
+
+    if _partial_report_has_movement_speed(report_update):
+        return "ready_movement_speed"
+    if _partial_report_location_changed(report_update, previous_locations):
+        return "ready_location_changed"
+    return None
+
+
+def _partial_report_has_movement_speed(report_update: Any | None) -> bool:
+    """Return True when a partial report explicitly carries non-zero movement."""
+    work_update = getattr(report_update, "work", None)
+    if work_update is None:
+        return False
+
+    incoming_work = work_update.to_dict(casing=betterproto2.Casing.SNAKE)
+    try:
+        return int(incoming_work.get("man_run_speed", 0)) != 0
+    except TypeError, ValueError:
+        return False
+
+
+def _partial_report_location_changed(
+    report_update: Any | None,
+    previous_locations: Any | None,
+) -> bool:
+    """Return True when a partial report carries a changed current location."""
+    current = _first_location_signature(getattr(report_update, "locations", None))
+    previous = _first_location_signature(previous_locations)
+    return current is not None and previous is not None and current != previous
+
+
+def _first_location_signature(locations: Any | None) -> tuple[int, int, int] | None:
+    """Return a compact signature for the first reported mower location."""
+    if not locations:
+        return None
+    location = locations[0]
+    try:
+        return (
+            int(getattr(location, "real_pos_x")),
+            int(getattr(location, "real_pos_y")),
+            int(getattr(location, "real_toward", 0)),
+        )
+    except AttributeError, TypeError, ValueError:
+        return None
 
 
 def _merge_model_update(current: Any, proto_update: Any) -> Any:

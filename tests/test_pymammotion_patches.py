@@ -19,7 +19,7 @@ from pymammotion.data.model.report_info import ReportData
 from pymammotion.data.mqtt.properties import MammotionPropertiesMessage
 from pymammotion.device.handle import DeviceHandle
 from pymammotion.device.state_reducer import MowerStateReducer
-from pymammotion.proto import ReportInfoData, RptDevStatus, RptWork
+from pymammotion.proto import ReportInfoData, RptDevLocation, RptDevStatus, RptWork
 from pymammotion.transport.aliyun_mqtt import AliyunMQTTTransport
 from pymammotion.transport.base import Transport
 from pymammotion.transport.mqtt import MQTTTransport
@@ -525,6 +525,87 @@ def test_partial_returning_report_clears_stale_charge_state() -> None:
 
     assert report.dev.sys_status == int(WorkMode.MODE_RETURNING)
     assert report.dev.charge_state == 0
+    assert report.dev.battery_val == 95
+
+
+def test_partial_ready_report_with_motion_clears_stale_charge_state() -> None:
+    """Ready plus movement evidence without charge_state is no longer docked."""
+    report = ReportData()
+    report.update(
+        ReportInfoData(
+            locations=[
+                RptDevLocation(
+                    real_pos_x=14490,
+                    real_pos_y=11146,
+                    real_toward=892800,
+                )
+            ]
+        )
+    )
+    report.dev.sys_status = int(WorkMode.MODE_READY)
+    report.dev.charge_state = 1
+    report.dev.battery_val = 95
+
+    report.update(
+        ReportInfoData(
+            dev=RptDevStatus(
+                sys_status=int(WorkMode.MODE_READY),
+                battery_val=95,
+                last_status=int(WorkMode.MODE_RETURNING),
+            ),
+            locations=[
+                RptDevLocation(
+                    real_pos_x=14002,
+                    real_pos_y=12486,
+                    real_toward=880123,
+                )
+            ],
+            work=RptWork(man_run_speed=-2),
+        )
+    )
+
+    assert report.dev.sys_status == int(WorkMode.MODE_READY)
+    assert report.dev.charge_state == 0
+    assert report.dev.battery_val == 95
+
+
+def test_partial_ready_report_without_motion_keeps_charge_state() -> None:
+    """Ready without charge_state also needs movement evidence before clearing."""
+    report = ReportData()
+    report.update(
+        ReportInfoData(
+            locations=[
+                RptDevLocation(
+                    real_pos_x=14490,
+                    real_pos_y=11146,
+                    real_toward=892800,
+                )
+            ]
+        )
+    )
+    report.dev.sys_status = int(WorkMode.MODE_READY)
+    report.dev.charge_state = 1
+    report.dev.battery_val = 95
+
+    report.update(
+        ReportInfoData(
+            dev=RptDevStatus(
+                sys_status=int(WorkMode.MODE_READY),
+                battery_val=95,
+                last_status=int(WorkMode.MODE_RETURNING),
+            ),
+            locations=[
+                RptDevLocation(
+                    real_pos_x=14490,
+                    real_pos_y=11146,
+                    real_toward=892800,
+                )
+            ],
+        )
+    )
+
+    assert report.dev.sys_status == int(WorkMode.MODE_READY)
+    assert report.dev.charge_state == 1
     assert report.dev.battery_val == 95
 
 
