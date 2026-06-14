@@ -1343,15 +1343,22 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
         """Fire a one-shot count=1 snapshot; no-op while BLE stream is active."""
         await self.manager.request_report_snapshot(self.device_name)
 
-    async def async_request_report_cfg(self, *, dedup_key: str = "report_cfg") -> None:
+    async def async_request_report_cfg(self, *, dedup_key: str = "report_cfg") -> bool:
         """Request the full legacy report config refresh when supported."""
         handle = self.manager.mower(self.device_name)
         if handle is None:
-            return
+            return False
         request_report_cfg = getattr(handle, "request_report_cfg", None)
         if request_report_cfg is None:
-            return
+            return False
         await request_report_cfg(dedup_key=dedup_key)
+        return True
+
+    async def async_request_report_refresh(
+        self, *, reason: str = "manual report request", priority: bool = True
+    ) -> None:
+        """Request the best available report refresh for this coordinator."""
+        await self.async_request_report_snapshot()
 
     async def async_start_report_stream(self, duration_ms: int = 300_000) -> None:
         """Start a transient continuous report window via the library."""
@@ -2631,13 +2638,19 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
     ) -> None:
         """Request a full report config refresh during bounded command watches."""
         if not self._has_usable_ble_transport():
-            if not self.is_online() or not self._cloud_snapshot_budget_allows(
-                priority=priority
-            ):
+            if not self.is_online():
+                LOGGER.warning(
+                    "report-coordinator [%s]: skipping full report cfg for %s "
+                    "because the mower is offline",
+                    self.device_name,
+                    reason,
+                )
+                return
+            if not self._cloud_snapshot_budget_allows(priority=priority):
                 return
 
         try:
-            await self.async_request_report_cfg(
+            enqueued = await self.async_request_report_cfg(
                 dedup_key=f"command_report_cfg:{reason}"
             )
         except (
@@ -2649,6 +2662,14 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
             self._log_cloud_snapshot_failure(reason, exc)
             return
 
+        if not enqueued:
+            LOGGER.warning(
+                "report-coordinator [%s]: full report cfg unavailable for %s",
+                self.device_name,
+                reason,
+            )
+            return
+
         self._last_cloud_snapshot_at = time.monotonic()
         LOGGER.info(
             "report-coordinator [%s]: full report cfg requested for %s",
@@ -2656,13 +2677,22 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
             reason,
         )
 
-    async def _async_request_command_report_refresh(self, reason: str) -> None:
-        """Run the bounded post-command report refresh pair."""
+    async def async_request_report_refresh(
+        self, *, reason: str = "manual report request", priority: bool = True
+    ) -> None:
+        """Request snapshot and full report refresh for explicit HA report calls."""
         await self._async_request_report_snapshot_guarded(
-            priority=True,
+            priority=priority,
             reason=reason,
         )
         await self._async_request_report_cfg_guarded(
+            priority=priority,
+            reason=reason,
+        )
+
+    async def _async_request_command_report_refresh(self, reason: str) -> None:
+        """Run the bounded post-command report refresh pair."""
+        await self.async_request_report_refresh(
             priority=True,
             reason=reason,
         )

@@ -120,7 +120,9 @@ def _get_single_mower_from_call(
 async def _handle_request_report(hass: HomeAssistant, call: ServiceCall) -> None:
     """Request one report snapshot for every referenced mower."""
     for mower in _get_mowers_from_call(hass, call):
-        await mower.reporting_coordinator.async_request_report_snapshot()
+        await mower.reporting_coordinator.async_request_report_refresh(
+            reason="service request_report"
+        )
 
 
 async def _handle_start_report_stream(hass: HomeAssistant, call: ServiceCall) -> None:
