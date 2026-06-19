@@ -42,6 +42,7 @@ CLOUD_REPORT_STREAM_STATES = frozenset(
         int(WorkMode.MODE_CHARGING_PAUSE),
     }
 )
+TERMINAL_DOCKED_LEFT_TIME_TOLERANCE = 1
 CLOUD_REPORT_ERROR_STATES = frozenset(
     {
         int(WorkMode.MODE_LOCK),
@@ -198,6 +199,17 @@ def is_terminal_docked_report_state(state: ReportPolicyState) -> bool:
 
     if not is_docked_report_state(state):
         return False
+
+    if state.charge_state not in (None, 0) and state.battery_val == 100:
+        completion_percent = _high_word_or_none(state.work_area)
+        left_time = _high_word_or_none(state.work_progress)
+        return (
+            completion_percent in (None, 0, 100)
+            and (
+                left_time is None
+                or left_time <= TERMINAL_DOCKED_LEFT_TIME_TOLERANCE
+            )
+        )
 
     completion_percent = _high_word_or_none(state.work_area)
     if completion_percent is not None and 0 < completion_percent < 100:

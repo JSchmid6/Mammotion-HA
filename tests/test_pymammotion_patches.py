@@ -388,6 +388,7 @@ def _device_handle_with_report(
     *,
     sys_status: int,
     charge_state: int,
+    battery_val: int = 90,
     bp_info: int,
     work_area: int,
     work_progress: int,
@@ -397,7 +398,7 @@ def _device_handle_with_report(
         dev=types.SimpleNamespace(
             sys_status=sys_status,
             charge_state=charge_state,
-            battery_val=90,
+            battery_val=battery_val,
             last_status=None,
         ),
         work=types.SimpleNamespace(
@@ -423,6 +424,21 @@ def test_job_watch_patch_ignores_terminal_docked_breakpoint_info() -> None:
         bp_info=7,
         work_area=186,
         work_progress=0,
+    )
+
+    assert not patches._has_unfinished_mow_job(handle)  # noqa: SLF001
+    assert not patches._is_recharge_pause_report_state(handle)  # noqa: SLF001
+
+
+def test_job_watch_patch_ignores_terminal_docked_tiny_remaining_time() -> None:
+    """A stale one-minute remainder must not keep cloud report streaming alive."""
+    handle = _device_handle_with_report(
+        sys_status=int(WorkMode.MODE_READY),
+        charge_state=1,
+        battery_val=100,
+        bp_info=1,
+        work_area=142,
+        work_progress=(1 << 16) | 93,
     )
 
     assert not patches._has_unfinished_mow_job(handle)  # noqa: SLF001

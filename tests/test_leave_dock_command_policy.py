@@ -332,3 +332,50 @@ def test_availability_probe_has_failure_backoff() -> None:
         attr.attr for attr in ast.walk(probe) if isinstance(attr, ast.Attribute)
     }
     assert "REPORT_AVAILABILITY_PROBE_MIN_INTERVAL" in names
+
+
+def test_fresh_report_wait_can_reconnect_stale_cloud_receive_path() -> None:
+    """Missing report replies should restart MQTT receive before giving up."""
+    tree = _coordinator_tree()
+    base = _class_def(tree, "MammotionBaseUpdateCoordinator")
+    wait = _async_method_def(base, "async_wait_for_fresh_report")
+    calls = _called_function_names(wait)
+
+    assert "_async_request_fresh_report_snapshot" in calls
+    assert "_async_wait_until_fresh_report" in calls
+    assert "_async_reconnect_cloud_receive" in calls
+
+
+def test_cloud_receive_reconnect_has_cooldown_and_restarts_transports() -> None:
+    """Receive-path repair must be bounded and actually restart cloud loops."""
+    tree = _coordinator_tree()
+    base = _class_def(tree, "MammotionBaseUpdateCoordinator")
+    reconnect = _async_method_def(base, "_async_reconnect_cloud_receive")
+    calls = _called_function_names(reconnect)
+    attrs = {attr.attr for attr in ast.walk(reconnect) if isinstance(attr, ast.Attribute)}
+
+    assert "_cloud_receive_reconnect_requesting" in attrs
+    assert "_cloud_receive_reconnect_on_cooldown" in calls
+    assert "_async_disconnect_cloud_receive_transports" in calls
+    assert "_async_connect_cloud_receive_transports" in calls
+
+    cooldown = _method_def(base, "_cloud_receive_reconnect_on_cooldown")
+    assert "CLOUD_RECEIVE_RECONNECT_COOLDOWN" in {
+        node.id for node in ast.walk(cooldown) if isinstance(node, ast.Name)
+    }
+
+    disconnect = _async_method_def(base, "_async_disconnect_cloud_receive_transports")
+    connect = _async_method_def(base, "_async_connect_cloud_receive_transports")
+    assert "disconnect" in _called_function_names(disconnect)
+    assert "connect" in _called_function_names(connect)
+
+
+def test_manual_report_refresh_waits_for_real_fresh_report() -> None:
+    """The HA request_report service path should validate a real report reply."""
+    tree = _coordinator_tree()
+    report = _class_def(tree, "MammotionReportUpdateCoordinator")
+    refresh = _async_method_def(report, "async_request_report_refresh")
+    calls = _called_function_names(refresh)
+
+    assert "async_wait_for_fresh_report" in calls
+    assert "_async_request_report_cfg_guarded" in calls

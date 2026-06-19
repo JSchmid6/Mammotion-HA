@@ -189,6 +189,34 @@ def test_terminal_docked_report_ignores_stale_breakpoint_info() -> None:
     )
 
 
+def test_terminal_docked_report_ignores_tiny_stale_remaining_time() -> None:
+    """Ready+full+docked with a stale one-minute remainder must stop job-watch."""
+    state = make_state(
+        charge_state=1,
+        battery_val=100,
+        bp_info=1,
+        work_area=142,
+        work_progress=encoded_high_word(1) | 93,
+    )
+
+    assert policy.is_terminal_docked_report_state(state)
+    assert not policy.has_unfinished_mow_job(state)
+    assert not policy.is_recharge_pause_state(state)
+    assert not policy.needs_continuous_report_stream(
+        state,
+        continuous_watch_active=True,
+        pause_watch_active=False,
+    )
+    assert (
+        policy.cloud_report_interval(
+            state,
+            continuous_watch_active=True,
+            pause_watch_active=False,
+        )
+        == policy.CLOUD_REPORT_DOCKED_INTERVAL
+    )
+
+
 def test_docked_report_with_preserved_work_remains_unfinished() -> None:
     """Ready+docked reports still stay watched when real work fields remain open."""
     state = make_state(
