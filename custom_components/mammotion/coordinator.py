@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import datetime
 import json
@@ -135,6 +136,8 @@ COMMAND_REPORT_SNAPSHOT_DELAYS: tuple[float, ...] = (
     COMMAND_REPORT_SNAPSHOT_DELAY,
     25.0,
 )
+CLOUD_RECEIVE_RECONNECT_COOLDOWN = 300.0
+CLOUD_RECEIVE_RECONNECT_WAIT = 8.0
 POST_COMMAND_REPORT_READ_ONLY_PREFIXES = ("get_", "query_", "read_")
 POST_COMMAND_REPORT_READ_ONLY_COMMANDS = frozenset(
     {
@@ -217,6 +220,8 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
         self.update_failures = 0
         self._last_command_warning_log_at: dict[str, float] = {}
         self._last_stale_availability_log_at = 0.0
+        self._last_cloud_receive_reconnect_at = 0.0
+        self._cloud_receive_reconnect_requesting = False
         self._stream_data: Response[StreamSubscriptionResponse] | None = (
             None  # Stream data [Agora]
         )
@@ -522,6 +527,7 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
         if require_fresh_report and not await self.async_wait_for_fresh_report(
             max_age=fresh_report_max_age,
             timeout=fresh_report_timeout,
+            reason=f"{command} pre-command freshness",
         ):
             self._log_command_warning(
                 "stale-report",
@@ -629,6 +635,7 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
         *,
         max_age: float,
         timeout: float,
+        reason: str = "fresh report",
     ) -> bool:
         """Request a report and wait until cached mower state is fresh enough."""
         if self.has_fresh_report(max_age=max_age):
@@ -637,7 +644,53 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
         handle = self.manager.mower(self.device_name)
         if handle is None:
             return False
+
+        deadline = time.monotonic() + timeout
         report_before = getattr(handle, "last_report_at", 0.0)
+        if not await self._async_request_fresh_report_snapshot(reason=reason):
+            return False
+        if await self._async_wait_until_fresh_report(
+            handle,
+            max_age=max_age,
+            deadline=deadline,
+            report_before=report_before,
+        ):
+            return True
+
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            self._log_command_warning(
+                "fresh-report-timeout",
+                "Mammotion fresh-report request for %s received no device "
+                "report for %.0fs during %s; reconnecting cloud MQTT receive "
+                "path once",
+                self.device_name,
+                timeout - remaining,
+                reason,
+            )
+            if await self._async_reconnect_cloud_receive(
+                reason=reason,
+                timeout=min(CLOUD_RECEIVE_RECONNECT_WAIT, remaining),
+            ):
+                handle = self.manager.mower(self.device_name)
+                if handle is None:
+                    return False
+                report_before = getattr(handle, "last_report_at", 0.0)
+                remaining = deadline - time.monotonic()
+                if remaining > 0 and await self._async_request_fresh_report_snapshot(
+                    reason=f"{reason} after cloud receive reconnect"
+                ):
+                    return await self._async_wait_until_fresh_report(
+                        handle,
+                        max_age=max_age,
+                        deadline=deadline,
+                        report_before=report_before,
+                    )
+
+        return self.has_fresh_report(max_age=max_age)
+
+    async def _async_request_fresh_report_snapshot(self, *, reason: str) -> bool:
+        """Request a report snapshot for a freshness probe."""
         try:
             await self.async_request_report_snapshot()
         except (
@@ -648,12 +701,23 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
         ) as exc:
             self._log_command_warning(
                 "fresh-report",
-                "Mammotion fresh-report request for %s failed: %s",
+                "Mammotion fresh-report request for %s failed during %s: %s",
                 self.device_name,
+                reason,
                 exc,
             )
             return False
-        deadline = time.monotonic() + timeout
+        return True
+
+    async def _async_wait_until_fresh_report(
+        self,
+        handle: Any,
+        *,
+        max_age: float,
+        deadline: float,
+        report_before: float,
+    ) -> bool:
+        """Wait until a newer raw mower report reaches the handle."""
         while time.monotonic() < deadline:
             if self.has_fresh_report(max_age=max_age) and (
                 not report_before
@@ -661,8 +725,123 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
             ):
                 return True
             await asyncio.sleep(0.25)
+        return False
 
-        return self.has_fresh_report(max_age=max_age)
+    async def _async_reconnect_cloud_receive(
+        self,
+        *,
+        reason: str,
+        timeout: float,
+    ) -> bool:
+        """Restart cloud MQTT receive loops after a report request gets no reply."""
+        if (
+            self._cloud_receive_reconnect_requesting
+            or not self._cloud_enabled
+            or not self.has_cloud_account
+        ):
+            return False
+
+        handle = self.manager.mower(self.device_name)
+        if handle is None:
+            return False
+        ble = handle.get_transport(TransportType.BLE)
+        if ble is not None and ble.is_connected and ble.is_usable:
+            return False
+
+        transports = self._cloud_receive_reconnect_transports(handle)
+        if not transports or self._cloud_receive_reconnect_on_cooldown():
+            return False
+
+        self._last_cloud_receive_reconnect_at = time.monotonic()
+        self._cloud_receive_reconnect_requesting = True
+        try:
+            self._log_command_warning(
+                "cloud-receive-reconnect",
+                "Mammotion reports for %s stopped arriving during %s; "
+                "reconnecting cloud MQTT receive path",
+                self.device_name,
+                reason,
+            )
+            await self._async_disconnect_cloud_receive_transports(transports)
+            if not await self._async_connect_cloud_receive_transports(transports):
+                return False
+            return await self._async_wait_for_mqtt_transport_connected(timeout)
+        finally:
+            self._cloud_receive_reconnect_requesting = False
+
+    def _cloud_receive_reconnect_transports(
+        self,
+        handle: Any,
+    ) -> list[tuple[TransportType, Any]]:
+        """Return usable cloud transports that can be receive-loop restarted."""
+        transports: list[tuple[TransportType, Any]] = []
+        for transport_type in (
+            TransportType.CLOUD_ALIYUN,
+            TransportType.CLOUD_MAMMOTION,
+        ):
+            transport = handle.get_transport(transport_type)
+            if transport is None or not getattr(transport, "is_usable", False):
+                continue
+            transports.append((transport_type, transport))
+        return transports
+
+    def _cloud_receive_reconnect_on_cooldown(self) -> bool:
+        """Return True when a previous receive reconnect is still cooling down."""
+        return (
+            time.monotonic() - self._last_cloud_receive_reconnect_at
+            < CLOUD_RECEIVE_RECONNECT_COOLDOWN
+        )
+
+    async def _async_disconnect_cloud_receive_transports(
+        self,
+        transports: list[tuple[TransportType, Any]],
+    ) -> None:
+        """Disconnect cloud transports directly so running stale tasks are stopped."""
+        for transport_type, transport in transports:
+            disconnect = getattr(transport, "disconnect", None)
+            if disconnect is None:
+                continue
+            with contextlib.suppress(Exception):
+                await disconnect()
+            LOGGER.debug(
+                "Mammotion cloud receive reconnect for %s disconnected %s",
+                self.device_name,
+                transport_type.value,
+            )
+
+    async def _async_connect_cloud_receive_transports(
+        self,
+        transports: list[tuple[TransportType, Any]],
+    ) -> bool:
+        """Connect cloud transports after a receive-loop restart."""
+        connected = False
+        for transport_type, transport in transports:
+            connect = getattr(transport, "connect", None)
+            if connect is None:
+                continue
+            try:
+                await connect()
+                connected = True
+            except EXPIRED_CREDENTIAL_EXCEPTIONS as exc:
+                await self.async_refresh_login(exc)
+                return False
+            except Exception:  # noqa: BLE001
+                LOGGER.debug(
+                    "Mammotion cloud receive reconnect for %s failed to connect %s",
+                    self.device_name,
+                    transport_type.value,
+                    exc_info=True,
+                )
+        return connected
+
+    async def _async_wait_for_mqtt_transport_connected(self, timeout: float) -> bool:
+        """Wait briefly until at least one cloud MQTT transport is connected."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.mqtt_transport_connected:
+                return True
+            await asyncio.sleep(0.25)
+        return self.mqtt_transport_connected
 
     def has_fresh_report(self, *, max_age: float) -> bool:
         """Return True when the last raw mower report is recent enough."""
@@ -2039,6 +2218,7 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
             fresh = await self.async_wait_for_fresh_report(
                 max_age=stale_after,
                 timeout=REPORT_AVAILABILITY_PROBE_TIMEOUT.total_seconds(),
+                reason=reason,
             )
         finally:
             self._availability_probe_requesting = False
@@ -2681,10 +2861,17 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         self, *, reason: str = "manual report request", priority: bool = True
     ) -> None:
         """Request snapshot and full report refresh for explicit HA report calls."""
-        await self._async_request_report_snapshot_guarded(
-            priority=priority,
+        stale_after = self._report_stale_after().total_seconds()
+        fresh = await self.async_wait_for_fresh_report(
+            max_age=stale_after,
+            timeout=REPORT_AVAILABILITY_PROBE_TIMEOUT.total_seconds(),
             reason=reason,
         )
+        if not fresh:
+            self._log_stale_availability(
+                reason=f"{reason} refresh timed out",
+                stale_after=stale_after,
+            )
         await self._async_request_report_cfg_guarded(
             priority=priority,
             reason=reason,
