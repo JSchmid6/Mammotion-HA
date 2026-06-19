@@ -73,7 +73,6 @@ async def async_setup_entry(
     """Set up the Mammotion camera entities."""
     mowers = entry.runtime_data.mowers
     entities = []
-    ice_servers = []
 
     non_luba1_mower = next(
         (
@@ -87,34 +86,39 @@ async def async_setup_entry(
     if non_luba1_mower is None:
         return
 
-    (
-        stream_data,
-        agora_response,
-    ) = await non_luba1_mower.reporting_coordinator.async_check_stream_expiry()
-
-    if agora_response is not None:
-        ice_servers = [
-            RTCIceServer(
-                urls=ice_server.urls,
-                username=ice_server.username,
-                credential=ice_server.credential,
-            )
-            for ice_server in agora_response.get_ice_servers(use_all_turn_servers=False)
-        ]
-
     for mower in mowers:
         if not DeviceType.is_luba1(mower.device.device_name):
             _LOGGER.debug("Config camera for %s", mower.device.device_name)
-            mower.reporting_coordinator._ice_servers = ice_servers
-
-            for entity_description in CAMERAS:
-                entities.append(
-                    MammotionWebRTCCamera(
-                        mower.reporting_coordinator, entity_description, hass
-                    )
+            entities.extend(
+                MammotionWebRTCCamera(
+                    mower.reporting_coordinator, entity_description, hass
                 )
+                for entity_description in CAMERAS
+            )
     async_add_entities(entities)
+    hass.async_create_task(
+        _async_prefetch_camera_stream(non_luba1_mower.reporting_coordinator)
+    )
     await async_setup_platform_services(hass, entry)
+
+
+async def _async_prefetch_camera_stream(
+    coordinator: MammotionBaseUpdateCoordinator,
+) -> None:
+    """Warm camera stream metadata without blocking integration setup."""
+    _stream_data, agora_response = await coordinator.async_check_stream_expiry()
+    if agora_response is None:
+        return
+
+    ice_servers = [
+        RTCIceServer(
+            urls=ice_server.urls,
+            username=ice_server.username,
+            credential=ice_server.credential,
+        )
+        for ice_server in agora_response.get_ice_servers(use_all_turn_servers=False)
+    ]
+    setattr(coordinator, "_ice_servers", ice_servers)
 
 
 class MammotionWebRTCCamera(MammotionCameraBaseEntity):
@@ -266,7 +270,7 @@ class MammotionWebRTCCamera(MammotionCameraBaseEntity):
 
     def get_ice_servers(self) -> list[RTCIceServer]:
         """Return the ICE servers from Agora API."""
-        return self.ice_servers
+        return getattr(self.coordinator, "_ice_servers", self.ice_servers)
 
 
 # Global
