@@ -1,6 +1,6 @@
 [project]
 name = "mammotion-ha"
-version = "0.5.81"
+version = "0.5.82"
 description = "Mammotion integration for HACS"
 authors = [
     {name = "Michael Arthur", email = "michael@jumblesoft.co.nz"},

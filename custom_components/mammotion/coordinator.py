@@ -636,9 +636,10 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
         max_age: float,
         timeout: float,
         reason: str = "fresh report",
+        require_new: bool = False,
     ) -> bool:
         """Request a report and wait until cached mower state is fresh enough."""
-        if self.has_fresh_report(max_age=max_age):
+        if not require_new and self.has_fresh_report(max_age=max_age):
             return True
 
         handle = self.manager.mower(self.device_name)
@@ -687,7 +688,11 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
                         report_before=report_before,
                     )
 
-        return self.has_fresh_report(max_age=max_age)
+        if not self.has_fresh_report(max_age=max_age):
+            return False
+        return not require_new or (
+            not report_before or getattr(handle, "last_report_at", 0.0) > report_before
+        )
 
     async def _async_request_fresh_report_snapshot(self, *, reason: str) -> bool:
         """Request a report snapshot for a freshness probe."""
@@ -2862,20 +2867,22 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
     ) -> None:
         """Request snapshot and full report refresh for explicit HA report calls."""
         stale_after = self._report_stale_after().total_seconds()
+        await self._async_ensure_active_report_stream(reason=f"{reason} refresh")
+        await self._async_request_report_cfg_guarded(
+            priority=priority,
+            reason=reason,
+        )
         fresh = await self.async_wait_for_fresh_report(
             max_age=stale_after,
             timeout=REPORT_AVAILABILITY_PROBE_TIMEOUT.total_seconds(),
             reason=reason,
+            require_new=True,
         )
         if not fresh:
             self._log_stale_availability(
                 reason=f"{reason} refresh timed out",
                 stale_after=stale_after,
             )
-        await self._async_request_report_cfg_guarded(
-            priority=priority,
-            reason=reason,
-        )
 
     async def _async_request_command_report_refresh(self, reason: str) -> None:
         """Run the bounded post-command report refresh pair."""
