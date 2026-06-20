@@ -2635,6 +2635,38 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
             < CLOUD_REPORT_STREAM_RENEW_INTERVAL.total_seconds()
         )
 
+    async def async_start_report_stream(self, duration_ms: int = 300_000) -> None:
+        """Start a report stream without bypassing cloud send protection."""
+        if self._has_usable_ble_transport():
+            await super().async_start_report_stream(duration_ms)
+            return
+
+        if self._cloud_report_stream_recent():
+            LOGGER.debug(
+                "report-coordinator [%s]: skipping report stream start because "
+                "a cloud stream was requested recently",
+                self.device_name,
+            )
+            return
+
+        if not self.is_online() or not self._cloud_snapshot_budget_allows(
+            priority=True
+        ):
+            return
+
+        try:
+            await super().async_start_report_stream(duration_ms)
+        except (
+            DeviceOfflineException,
+            NoTransportAvailableError,
+            TransportRateLimitedError,
+            TooManyRequestsException,
+        ) as exc:
+            self._log_cloud_snapshot_failure("start report stream", exc)
+            return
+
+        self._last_cloud_stream_start_at = time.monotonic()
+
     def _cloud_snapshot_budget_allows(self, *, priority: bool) -> bool:
         """Return True when a cloud snapshot should be allowed by the send budget."""
         if not self._cloud_enabled or not self.has_cloud_account:

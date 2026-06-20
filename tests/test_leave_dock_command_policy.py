@@ -410,3 +410,16 @@ def test_manual_report_refresh_waits_for_real_fresh_report() -> None:
         and node.func.attr == "async_wait_for_fresh_report"
         for keyword in node.keywords
     )
+
+
+def test_direct_report_stream_start_respects_cloud_budget() -> None:
+    """HA report-stream service calls must not bypass cloud send guards."""
+    tree = _coordinator_tree()
+    report = _class_def(tree, "MammotionReportUpdateCoordinator")
+    stream = _async_method_def(report, "async_start_report_stream")
+    calls = _called_function_names(stream)
+
+    assert "_has_usable_ble_transport" in calls
+    assert "_cloud_report_stream_recent" in calls
+    assert "_cloud_snapshot_budget_allows" in calls
+    assert "_log_cloud_snapshot_failure" in calls
