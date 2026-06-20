@@ -61,6 +61,20 @@ def _called_function_names(node: ast.AST) -> set[str]:
     return names
 
 
+def _called_function_names_in_order(node: ast.AST) -> list[str]:
+    """Return function and method call names in source order."""
+    calls = [call for call in ast.walk(node) if isinstance(call, ast.Call)]
+    calls.sort(key=lambda call: (call.lineno, call.col_offset))
+
+    names: list[str] = []
+    for call in calls:
+        if isinstance(call.func, ast.Attribute):
+            names.append(call.func.attr)
+        elif isinstance(call.func, ast.Name):
+            names.append(call.func.id)
+    return names
+
+
 def _constant_values(node: ast.AST) -> set[Any]:
     """Return constants used inside an AST node."""
     return {
@@ -352,7 +366,9 @@ def test_cloud_receive_reconnect_has_cooldown_and_restarts_transports() -> None:
     base = _class_def(tree, "MammotionBaseUpdateCoordinator")
     reconnect = _async_method_def(base, "_async_reconnect_cloud_receive")
     calls = _called_function_names(reconnect)
-    attrs = {attr.attr for attr in ast.walk(reconnect) if isinstance(attr, ast.Attribute)}
+    attrs = {
+        attr.attr for attr in ast.walk(reconnect) if isinstance(attr, ast.Attribute)
+    }
 
     assert "_cloud_receive_reconnect_requesting" in attrs
     assert "_cloud_receive_reconnect_on_cooldown" in calls
@@ -376,6 +392,21 @@ def test_manual_report_refresh_waits_for_real_fresh_report() -> None:
     report = _class_def(tree, "MammotionReportUpdateCoordinator")
     refresh = _async_method_def(report, "async_request_report_refresh")
     calls = _called_function_names(refresh)
+    ordered_calls = _called_function_names_in_order(refresh)
 
+    assert "_async_ensure_active_report_stream" in calls
     assert "async_wait_for_fresh_report" in calls
     assert "_async_request_report_cfg_guarded" in calls
+    assert ordered_calls.index(
+        "_async_request_report_cfg_guarded"
+    ) < ordered_calls.index("async_wait_for_fresh_report")
+    assert any(
+        keyword.arg == "require_new"
+        and isinstance(keyword.value, ast.Constant)
+        and keyword.value.value is True
+        for node in ast.walk(refresh)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "async_wait_for_fresh_report"
+        for keyword in node.keywords
+    )
