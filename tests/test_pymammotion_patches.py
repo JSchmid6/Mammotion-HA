@@ -19,7 +19,16 @@ from pymammotion.data.model.report_info import ReportData
 from pymammotion.data.mqtt.properties import MammotionPropertiesMessage
 from pymammotion.device.handle import DeviceHandle
 from pymammotion.device.state_reducer import MowerStateReducer
-from pymammotion.proto import ReportInfoData, RptDevLocation, RptDevStatus, RptWork
+from pymammotion.proto import (
+    LubaMsg,
+    MctlNav,
+    MctlSys,
+    NavSysParamMsg,
+    ReportInfoData,
+    RptDevLocation,
+    RptDevStatus,
+    RptWork,
+)
 from pymammotion.transport.aliyun_mqtt import AliyunMQTTTransport
 from pymammotion.transport.base import Transport
 from pymammotion.transport.mqtt import MQTTTransport
@@ -148,6 +157,28 @@ def test_login_helper_keeps_successful_v2_response() -> None:
     assert response is fake.v2
     assert legacy_used is False
     assert fake.calls == ["login_v2"]
+
+
+def test_raw_message_patch_preserves_report_freshness_for_non_report_frames() -> None:
+    """Only real report-data frames should satisfy HA freshness waits."""
+    handle = DeviceHandle(
+        device_id="dev-fresh",
+        device_name="Luba-Fresh",
+        initial_device=MowerDevice(name="Luba-Fresh"),
+    )
+
+    report = LubaMsg(
+        sys=MctlSys(toapp_report_data=ReportInfoData(dev=RptDevStatus(battery_val=42)))
+    )
+    asyncio.run(handle.on_raw_message(bytes(report)))
+
+    report_at = handle.last_report_at
+    assert report_at > 0.0
+
+    nav_message = LubaMsg(nav=MctlNav(nav_sys_param_cmd=NavSysParamMsg(id=3, context=1)))
+    asyncio.run(handle.on_raw_message(bytes(nav_message)))
+
+    assert handle.last_report_at == report_at
 
 
 def test_empty_v2_device_page_still_bootstraps_aliyun(

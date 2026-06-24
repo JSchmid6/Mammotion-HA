@@ -22,6 +22,7 @@ from pymammotion.data.model.report_info import ReportData
 from pymammotion.device.handle import DeviceHandle
 from pymammotion.device.state_reducer import MowerStateReducer
 from pymammotion.http.http import MammotionHTTP
+from pymammotion.proto import LubaMsg
 from pymammotion.transport import aliyun_mqtt as _aliyun_mqtt
 from pymammotion.transport.aliyun_mqtt import AliyunMQTTTransport
 from pymammotion.transport.base import (
@@ -640,16 +641,43 @@ async def _on_raw_message_with_source(
 ) -> None:
     """Track the inbound transport while a raw device message is reduced."""
     if _REPORT_SOURCE_CONTEXT.get() is not None:
-        await _original_on_raw_message(self, payload, transport_type)
+        await _call_original_on_raw_message(self, payload, transport_type)
         return
 
     token = _REPORT_SOURCE_CONTEXT.set(
         {"transport": str(transport_type.value), "topic": "unknown"}
     )
     try:
-        await _original_on_raw_message(self, payload, transport_type)
+        await _call_original_on_raw_message(self, payload, transport_type)
     finally:
         _REPORT_SOURCE_CONTEXT.reset(token)
+
+
+async def _call_original_on_raw_message(
+    self: DeviceHandle,
+    payload: bytes,
+    transport_type: TransportType,
+) -> None:
+    """Call PyMammotion while preserving report freshness for non-report frames."""
+    report_before = getattr(self, "_last_report_at", 0.0)
+    updates_report_data = _raw_message_updates_report_data(payload)
+    try:
+        await _original_on_raw_message(self, payload, transport_type)
+    finally:
+        if not updates_report_data:
+            self._last_report_at = report_before  # noqa: SLF001
+
+
+def _raw_message_updates_report_data(payload: bytes) -> bool:
+    """Return True when the raw device frame carries toapp_report_data."""
+    try:
+        message = LubaMsg().parse(payload)
+    except UnicodeDecodeError:
+        return False
+    except Exception:  # noqa: BLE001
+        return False
+    sys_msg = getattr(message, "sys", None)
+    return sys_msg is not None and getattr(sys_msg, "toapp_report_data", None) is not None
 
 
 def _report_data_update_preserve_partial_state(self: ReportData, data: Any) -> None:
