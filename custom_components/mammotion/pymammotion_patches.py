@@ -71,6 +71,7 @@ _original_apply_mammotion_properties = getattr(
 )
 _original_on_raw_message = DeviceHandle.on_raw_message
 _original_login_and_initiate_cloud = MammotionClient.login_and_initiate_cloud
+_original_raw_message_emits_report_pulses: bool | None = None
 
 
 def _patch_warning_allowed(key: str) -> bool:
@@ -660,12 +661,66 @@ async def _call_original_on_raw_message(
 ) -> None:
     """Call PyMammotion while preserving report freshness for non-report frames."""
     report_before = getattr(self, "_last_report_at", 0.0)
+    snapshot_before = getattr(getattr(self, "state_machine", None), "current", None)
     updates_report_data = _raw_message_updates_report_data(payload)
     try:
         await _original_on_raw_message(self, payload, transport_type)
     finally:
         if not updates_report_data:
             self._last_report_at = report_before  # noqa: SLF001
+    if updates_report_data and not _original_emits_report_data_pulses():
+        await _emit_report_data_snapshot_if_needed(self, snapshot_before)
+
+
+async def _emit_report_data_snapshot_if_needed(
+    self: DeviceHandle, snapshot_before: Any
+) -> None:
+    """Emit applied report-data frames even when values did not change."""
+    if getattr(self, "_stopping", False):
+        return
+    snapshot_after = getattr(getattr(self, "state_machine", None), "current", None)
+    if snapshot_before is None or snapshot_after is None:
+        return
+    before_sequence = getattr(snapshot_before, "sequence", None)
+    after_sequence = getattr(snapshot_after, "sequence", None)
+    if (
+        before_sequence is None
+        or after_sequence is None
+        or after_sequence <= before_sequence
+    ):
+        return
+    if _snapshot_top_level_changed(snapshot_before, snapshot_after):
+        return
+    bus = getattr(self, "_state_changed_bus", None)
+    emit = getattr(bus, "emit", None)
+    if emit is None:
+        return
+    await emit(snapshot_after)
+
+
+def _snapshot_top_level_changed(snapshot_before: Any, snapshot_after: Any) -> bool:
+    """Return True when PyMammotion's current emit gate would already fire."""
+    return any(
+        getattr(snapshot_before, field, None) != getattr(snapshot_after, field, None)
+        for field in ("connection_state", "online", "enabled", "battery_level")
+    )
+
+
+def _original_emits_report_data_pulses() -> bool:
+    """Return True once PyMammotion emits unchanged report-data frames itself."""
+    global _original_raw_message_emits_report_pulses  # noqa: PLW0603
+    if _original_raw_message_emits_report_pulses is not None:
+        return _original_raw_message_emits_report_pulses
+    try:
+        source = inspect.getsource(_original_on_raw_message)
+    except OSError, TypeError:
+        _original_raw_message_emits_report_pulses = False
+    else:
+        _original_raw_message_emits_report_pulses = (
+            "changed or _has_report_data(luba_msg)" in source
+            or "changed or has_report_data" in source
+        )
+    return _original_raw_message_emits_report_pulses
 
 
 def _raw_message_updates_report_data(payload: bytes) -> bool:
@@ -677,7 +732,9 @@ def _raw_message_updates_report_data(payload: bytes) -> bool:
     except Exception:  # noqa: BLE001
         return False
     sys_msg = getattr(message, "sys", None)
-    return sys_msg is not None and getattr(sys_msg, "toapp_report_data", None) is not None
+    return (
+        sys_msg is not None and getattr(sys_msg, "toapp_report_data", None) is not None
+    )
 
 
 def _report_data_update_preserve_partial_state(self: ReportData, data: Any) -> None:
