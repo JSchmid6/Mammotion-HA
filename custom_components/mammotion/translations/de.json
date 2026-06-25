@@ -193,6 +193,9 @@
           "reported_offline": "Offline gemeldet"
         }
       },
+      "last_real_report": {
+        "name": "Letzter echter Bericht"
+      },
       "maintenance_distance": {
         "name": "Gesamtkilometerstand"
       },

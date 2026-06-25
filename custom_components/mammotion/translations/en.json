@@ -193,6 +193,9 @@
           "reported_offline": "Reported offline"
         }
       },
+      "last_real_report": {
+        "name": "Last real report"
+      },
       "task_area_status": {
         "name": "Task area {name}",
         "state": {

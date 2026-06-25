@@ -167,6 +167,7 @@ POST_COMMAND_REPORT_ALWAYS_COMMANDS = frozenset(
     }
 )
 MAP_SYNC_STATUSES = ("synced", "syncing", "out_of_sync")
+LAST_REAL_REPORT_TIME_ATTR = "_mammotion_ha_last_real_report_time"
 SEND_AND_WAIT_EXCEPTIONS = (
     *EXPIRED_CREDENTIAL_EXCEPTIONS,
     DeviceOfflineException,
@@ -2107,6 +2108,15 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         if not last_report_at:
             return None
         return time.monotonic() - last_report_at
+
+    @property
+    def last_report_received_at(self) -> datetime.datetime | None:
+        """Return when the last accepted real mower report reached this handle."""
+        handle = self.manager.mower(self.device_name)
+        if handle is None:
+            return None
+        value = getattr(handle, LAST_REAL_REPORT_TIME_ATTR, None)
+        return value if isinstance(value, datetime.datetime) else None
 
     def _availability_probe_active(self) -> bool:
         """Return True while a stale report is being actively rechecked."""
