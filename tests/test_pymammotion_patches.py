@@ -175,10 +175,47 @@ def test_raw_message_patch_preserves_report_freshness_for_non_report_frames() ->
     report_at = handle.last_report_at
     assert report_at > 0.0
 
-    nav_message = LubaMsg(nav=MctlNav(nav_sys_param_cmd=NavSysParamMsg(id=3, context=1)))
+    nav_message = LubaMsg(
+        nav=MctlNav(nav_sys_param_cmd=NavSysParamMsg(id=3, context=1))
+    )
     asyncio.run(handle.on_raw_message(bytes(nav_message)))
 
     assert handle.last_report_at == report_at
+
+
+def test_report_data_frame_emits_snapshot_when_values_are_unchanged() -> None:
+    """Fresh real reports should reach HA even when the state value is unchanged."""
+
+    async def _run() -> None:
+        handle = DeviceHandle(
+            device_id="dev-report-pulse",
+            device_name="Luba-Report-Pulse",
+            initial_device=MowerDevice(name="Luba-Report-Pulse"),
+        )
+        received: list[Any] = []
+
+        async def _on_state_changed(snapshot: object) -> None:
+            received.append(snapshot)
+
+        subscription = handle.subscribe_state_changed(_on_state_changed)
+        try:
+            report = LubaMsg(
+                sys=MctlSys(
+                    toapp_report_data=ReportInfoData(dev=RptDevStatus(battery_val=42))
+                )
+            )
+            await handle.on_raw_message(bytes(report))
+            assert received
+
+            received.clear()
+            await handle.on_raw_message(bytes(report))
+
+            assert len(received) == 1
+            assert received[0].raw.report_data.dev.battery_val == 42
+        finally:
+            subscription.cancel()
+
+    asyncio.run(_run())
 
 
 def test_empty_v2_device_page_still_bootstraps_aliyun(
