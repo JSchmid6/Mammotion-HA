@@ -8,6 +8,7 @@ import json
 import sys
 import time
 import types
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -206,16 +207,49 @@ def test_report_data_frame_emits_snapshot_when_values_are_unchanged() -> None:
             )
             await handle.on_raw_message(bytes(report))
             assert received
+            first_report_time = getattr(handle, patches._LAST_REAL_REPORT_TIME_ATTR)  # noqa: SLF001
 
             received.clear()
             await handle.on_raw_message(bytes(report))
 
             assert len(received) == 1
             assert received[0].raw.report_data.dev.battery_val == 42
+            assert isinstance(
+                getattr(handle, patches._LAST_REAL_REPORT_TIME_ATTR),  # noqa: SLF001
+                datetime,
+            )
+            assert (
+                getattr(handle, patches._LAST_REAL_REPORT_TIME_ATTR)  # noqa: SLF001
+                > first_report_time
+            )
         finally:
             subscription.cancel()
 
     asyncio.run(_run())
+
+
+def test_rejected_report_data_frame_does_not_mark_report_fresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Report-data frames rejected by the reducer must not satisfy freshness waits."""
+    handle = DeviceHandle(
+        device_id="dev-rejected-report",
+        device_name="Luba-Rejected-Report",
+        initial_device=MowerDevice(name="Luba-Rejected-Report"),
+    )
+
+    def _reject_report(current: MowerDevice, message: LubaMsg) -> MowerDevice:
+        return current
+
+    monkeypatch.setattr(handle._reducer, "apply", _reject_report)  # noqa: SLF001
+
+    report = LubaMsg(
+        sys=MctlSys(toapp_report_data=ReportInfoData(dev=RptDevStatus(battery_val=42)))
+    )
+    asyncio.run(handle.on_raw_message(bytes(report)))
+
+    assert handle.last_report_at == 0.0
+    assert getattr(handle, patches._LAST_REAL_REPORT_TIME_ATTR, None) is None  # noqa: SLF001
 
 
 def test_empty_v2_device_page_still_bootstraps_aliyun(

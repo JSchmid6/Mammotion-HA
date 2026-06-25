@@ -9,7 +9,7 @@ import json
 import logging
 import time
 from copy import deepcopy
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import betterproto2
@@ -54,6 +54,8 @@ _REPORT_SANITY_PATCH_ATTR = "_mammotion_ha_report_sanity_patch"
 _MAMMOTION_PROPERTIES_PATCH_ATTR = "_mammotion_ha_mammotion_properties_patch"
 _RAW_MESSAGE_SOURCE_PATCH_ATTR = "_mammotion_ha_raw_message_source_patch"
 _LEGACY_LOGIN_PATCH_ATTR = "_mammotion_ha_legacy_login_fallback_patch"
+_LAST_REAL_REPORT_TIME_ATTR = "_mammotion_ha_last_real_report_time"
+_LAST_REAL_REPORT_SEQUENCE_ATTR = "_mammotion_ha_last_real_report_sequence"
 _PATCH_WARNING_LOG_INTERVAL = 900.0
 _LOGGER = logging.getLogger(__name__)
 _last_patch_warning_log_at: dict[str, float] = {}
@@ -668,8 +670,43 @@ async def _call_original_on_raw_message(
     finally:
         if not updates_report_data:
             self._last_report_at = report_before  # noqa: SLF001
-    if updates_report_data and not _original_emits_report_data_pulses():
+
+    if not updates_report_data:
+        return
+
+    report_applied = _report_data_snapshot_applied(self, snapshot_before)
+    if not report_applied:
+        self._last_report_at = report_before  # noqa: SLF001
+        return
+
+    _mark_real_report_received(self)
+    if not _original_emits_report_data_pulses():
         await _emit_report_data_snapshot_if_needed(self, snapshot_before)
+
+
+def _report_data_snapshot_applied(self: DeviceHandle, snapshot_before: Any) -> bool:
+    """Return True when a report-data frame produced a new raw state snapshot."""
+    snapshot_after = getattr(getattr(self, "state_machine", None), "current", None)
+    if snapshot_before is None or snapshot_after is None:
+        return False
+    before_sequence = getattr(snapshot_before, "sequence", None)
+    after_sequence = getattr(snapshot_after, "sequence", None)
+    if (
+        before_sequence is None
+        or after_sequence is None
+        or after_sequence <= before_sequence
+    ):
+        return False
+    return getattr(snapshot_after, "raw", None) is not getattr(
+        snapshot_before, "raw", None
+    )
+
+
+def _mark_real_report_received(self: DeviceHandle) -> None:
+    """Expose the wall-clock time of the last accepted real mower report."""
+    snapshot = getattr(getattr(self, "state_machine", None), "current", None)
+    setattr(self, _LAST_REAL_REPORT_TIME_ATTR, datetime.now(UTC))
+    setattr(self, _LAST_REAL_REPORT_SEQUENCE_ATTR, getattr(snapshot, "sequence", None))
 
 
 async def _emit_report_data_snapshot_if_needed(
