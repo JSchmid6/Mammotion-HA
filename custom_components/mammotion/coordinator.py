@@ -2794,6 +2794,53 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         await start_forced(duration_ms)
         return True
 
+    async def _async_force_report_stream_refresh(
+        self,
+        *,
+        reason: str,
+        priority: bool,
+    ) -> bool:
+        """Force-renew a cloud report stream once after an explicit report timeout."""
+        if self._cloud_stream_requesting:
+            return False
+        if self._has_usable_ble_transport():
+            return False
+        if not self._needs_continuous_report_stream(self.data):
+            return False
+        if not self.is_online() or not self._cloud_snapshot_budget_allows(
+            priority=priority
+        ):
+            return False
+
+        self._cloud_stream_requesting = True
+        try:
+            LOGGER.warning(
+                "report-coordinator [%s]: forcing cloud report stream refresh "
+                "after %s timed out without a fresh mower report",
+                self.device_name,
+                reason,
+            )
+            if not await self._async_start_forced_report_stream(
+                CLOUD_REPORT_STREAM_DURATION_MS
+            ):
+                return False
+        except (
+            DeviceOfflineException,
+            NoTransportAvailableError,
+            TransportRateLimitedError,
+            TooManyRequestsException,
+        ) as exc:
+            self._log_cloud_snapshot_failure(
+                f"{reason} forced report stream refresh",
+                exc,
+            )
+            return False
+        finally:
+            self._cloud_stream_requesting = False
+
+        self._last_cloud_stream_start_at = time.monotonic()
+        return True
+
     async def _async_request_report_snapshot_guarded(
         self, *, priority: bool = False, reason: str
     ) -> None:
@@ -2909,6 +2956,7 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
     ) -> None:
         """Request snapshot and full report refresh for explicit HA report calls."""
         stale_after = self._report_stale_after().total_seconds()
+        started_at = time.monotonic()
         await self._async_ensure_active_report_stream(reason=f"{reason} refresh")
         await self._async_request_report_cfg_guarded(
             priority=priority,
@@ -2920,11 +2968,29 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
             reason=reason,
             require_new=True,
         )
-        if not fresh:
-            self._log_stale_availability(
-                reason=f"{reason} refresh timed out",
-                stale_after=stale_after,
+        if not fresh and await self._async_force_report_stream_refresh(
+            reason=reason,
+            priority=priority,
+        ):
+            fresh = await self.async_wait_for_fresh_report(
+                max_age=stale_after,
+                timeout=REPORT_AVAILABILITY_PROBE_TIMEOUT.total_seconds(),
+                reason=f"{reason} forced stream refresh",
+                require_new=True,
             )
+        if fresh:
+            LOGGER.info(
+                "report-coordinator [%s]: fresh mower report received for %s "
+                "after %.1fs",
+                self.device_name,
+                reason,
+                time.monotonic() - started_at,
+            )
+            return
+        self._log_stale_availability(
+            reason=f"{reason} refresh timed out",
+            stale_after=stale_after,
+        )
 
     async def _async_request_command_report_refresh(self, reason: str) -> None:
         """Run the bounded post-command report refresh pair."""

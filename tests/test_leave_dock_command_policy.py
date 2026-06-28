@@ -412,6 +412,30 @@ def test_manual_report_refresh_waits_for_real_fresh_report() -> None:
     )
 
 
+def test_manual_report_refresh_force_renews_stream_once_after_timeout() -> None:
+    """Explicit report refresh should repair a stale-but-recent cloud stream once."""
+    tree = _coordinator_tree()
+    report = _class_def(tree, "MammotionReportUpdateCoordinator")
+    refresh = _async_method_def(report, "async_request_report_refresh")
+    calls = _called_function_names(refresh)
+    ordered_calls = _called_function_names_in_order(refresh)
+
+    assert "_async_force_report_stream_refresh" in calls
+    assert ordered_calls.index("async_wait_for_fresh_report") < ordered_calls.index(
+        "_async_force_report_stream_refresh"
+    )
+
+    force_refresh = _async_method_def(report, "_async_force_report_stream_refresh")
+    force_calls = _called_function_names(force_refresh)
+    force_names = {
+        node.id for node in ast.walk(force_refresh) if isinstance(node, ast.Name)
+    }
+
+    assert "_cloud_snapshot_budget_allows" in force_calls
+    assert "_async_start_forced_report_stream" in force_calls
+    assert "CLOUD_REPORT_STREAM_DURATION_MS" in force_names
+
+
 def test_direct_report_stream_start_respects_cloud_budget() -> None:
     """HA report-stream service calls must not bypass cloud send guards."""
     tree = _coordinator_tree()
