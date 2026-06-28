@@ -54,6 +54,9 @@ _REPORT_SANITY_PATCH_ATTR = "_mammotion_ha_report_sanity_patch"
 _MAMMOTION_PROPERTIES_PATCH_ATTR = "_mammotion_ha_mammotion_properties_patch"
 _RAW_MESSAGE_SOURCE_PATCH_ATTR = "_mammotion_ha_raw_message_source_patch"
 _LEGACY_LOGIN_PATCH_ATTR = "_mammotion_ha_legacy_login_fallback_patch"
+_STREAM_SUBSCRIPTION_AUTH_PATCH_ATTR = (
+    "_mammotion_ha_stream_subscription_auth_recovery_patch"
+)
 _LAST_REAL_REPORT_TIME_ATTR = "_mammotion_ha_last_real_report_time"
 _LAST_REAL_REPORT_SEQUENCE_ATTR = "_mammotion_ha_last_real_report_sequence"
 _PATCH_WARNING_LOG_INTERVAL = 900.0
@@ -73,6 +76,7 @@ _original_apply_mammotion_properties = getattr(
 )
 _original_on_raw_message = DeviceHandle.on_raw_message
 _original_login_and_initiate_cloud = MammotionClient.login_and_initiate_cloud
+_original_fetch_stream_subscription = MammotionClient._fetch_stream_subscription  # noqa: SLF001
 _original_raw_message_emits_report_pulses: bool | None = None
 
 
@@ -237,6 +241,7 @@ async def _start_forced_report_stream(
 def apply_pymammotion_patches() -> None:
     """Apply pymammotion compatibility patches once."""
     _patch_client_login()
+    _patch_stream_subscription_auth_recovery()
     _patch_device_handle_send_and_streams()
     _patch_aliyun_transport()
     _patch_mqtt_transport()
@@ -253,6 +258,95 @@ def _patch_client_login() -> None:
             _login_and_initiate_cloud_with_legacy_fallback,
         )
         setattr(MammotionClient, _LEGACY_LOGIN_PATCH_ATTR, True)
+
+
+def _patch_stream_subscription_auth_recovery() -> None:
+    """Refresh Mammotion HTTP auth after stream-token endpoint 401 responses."""
+    if getattr(MammotionClient, _STREAM_SUBSCRIPTION_AUTH_PATCH_ATTR, False):
+        return
+    if _stream_subscription_auth_recovery_present():
+        setattr(MammotionClient, _STREAM_SUBSCRIPTION_AUTH_PATCH_ATTR, True)
+        return
+    setattr(
+        MammotionClient,
+        "_fetch_stream_subscription",
+        _fetch_stream_subscription_with_auth_recovery,
+    )
+    setattr(MammotionClient, _STREAM_SUBSCRIPTION_AUTH_PATCH_ATTR, True)
+
+
+def _stream_subscription_auth_recovery_present() -> bool:
+    """Return True when upstream already refreshes auth on stream-token 401."""
+    try:
+        source = inspect.getsource(MammotionClient._fetch_stream_subscription)  # noqa: SLF001
+    except OSError, TypeError:
+        return False
+    return "refresh_login" in source and "401" in source
+
+
+async def _fetch_stream_subscription_with_auth_recovery(
+    self: MammotionClient,
+    http: MammotionHTTP,
+    iot_id: str,
+    is_yuka: bool,
+) -> Any:
+    """Retry stream-token fetch once after a real Mammotion HTTP 401."""
+    subscription = await _original_fetch_stream_subscription(
+        self,
+        http,
+        iot_id,
+        is_yuka,
+    )
+    if not _stream_subscription_needs_auth_refresh(subscription):
+        return subscription
+
+    account = str(getattr(http, "account", "") or "unknown")
+    _log_patch_warning(
+        "stream-subscription-auth-refresh",
+        (
+            "pymammotion stream-token endpoint returned 401 for account %s; "
+            "refreshing Mammotion HTTP login and retrying once"
+        ),
+        _redacted_account(account),
+    )
+    try:
+        refresh_http = _stream_subscription_refresh_http(self)
+        if refresh_http is not None:
+            await refresh_http()
+        else:
+            await http.refresh_login()
+    except Exception:  # noqa: BLE001
+        _LOGGER.warning(
+            "pymammotion stream-token auth refresh failed for account %s",
+            _redacted_account(account),
+            exc_info=True,
+        )
+        return subscription
+
+    retried = await http.get_stream_subscription(iot_id, is_yuka)
+    if retried is None or getattr(retried, "data", None) is None:
+        _LOGGER.error(
+            "get_stream_subscription for %s still returned no data after auth refresh "
+            "(response=%s)",
+            iot_id,
+            retried,
+        )
+    return retried
+
+
+def _stream_subscription_needs_auth_refresh(subscription: Any) -> bool:
+    """Return True for the concrete stream-token 401/no-data response."""
+    return (
+        subscription is not None
+        and getattr(subscription, "code", None) == 401
+        and getattr(subscription, "data", None) is None
+    )
+
+
+def _stream_subscription_refresh_http(self: MammotionClient) -> Any | None:
+    """Return TokenManager HTTP refresh when it is available for persistence."""
+    token_manager = getattr(self, "token_manager", None)
+    return getattr(token_manager, "refresh_http", None)
 
 
 async def _login_and_initiate_cloud_with_legacy_fallback(

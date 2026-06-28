@@ -92,6 +92,16 @@ class _Response:
         self.msg = msg
 
 
+class _StreamResponse:
+    """Small response stub for stream subscription auth recovery tests."""
+
+    def __init__(self, code: int, data: Any | None = None, msg: str = "") -> None:
+        """Store response code, message, and optional payload."""
+        self.code = code
+        self.data = data
+        self.msg = msg
+
+
 class _FakeHttp:
     """Fake MammotionHTTP login surface."""
 
@@ -110,6 +120,32 @@ class _FakeHttp:
         """Return the configured legacy login response."""
         self.calls.append("login")
         return self.legacy
+
+
+class _FakeStreamHttp:
+    """Fake MammotionHTTP stream-token surface."""
+
+    account = "stream@example.com"
+
+    def __init__(self, responses: list[_StreamResponse]) -> None:
+        """Store queued stream-token responses."""
+        self.responses = responses
+        self.calls: list[tuple[str, bool]] = []
+        self.refreshes = 0
+
+    async def get_stream_subscription(
+        self,
+        iot_id: str,
+        is_yuka: bool,
+    ) -> _StreamResponse:
+        """Return the next queued stream-token response."""
+        self.calls.append((iot_id, is_yuka))
+        return self.responses.pop(0)
+
+    async def refresh_login(self) -> _StreamResponse:
+        """Record that HTTP auth was refreshed."""
+        self.refreshes += 1
+        return _StreamResponse(0, object())
 
 
 def test_login_and_initiate_cloud_is_patched_for_legacy_shared_accounts() -> None:
@@ -158,6 +194,38 @@ def test_login_helper_keeps_successful_v2_response() -> None:
     assert response is fake.v2
     assert legacy_used is False
     assert fake.calls == ["login_v2"]
+
+
+def test_stream_subscription_401_refreshes_http_auth_and_retries() -> None:
+    """Stream-token 401 responses should refresh HTTP auth before the final retry."""
+
+    async def _run() -> None:
+        recovered_data = object()
+        http = _FakeStreamHttp(
+            [
+                _StreamResponse(
+                    401, None, "Access to this resource requires authentication"
+                ),
+                _StreamResponse(
+                    401, None, "Access to this resource requires authentication"
+                ),
+                _StreamResponse(0, recovered_data, "success"),
+            ]
+        )
+        client = types.SimpleNamespace(token_manager=None)
+
+        result = await MammotionClient._fetch_stream_subscription(  # noqa: SLF001
+            client,
+            http,
+            "iot-123",
+            True,
+        )
+
+        assert result.data is recovered_data
+        assert http.refreshes == 1
+        assert http.calls == [("iot-123", True)] * 3
+
+    asyncio.run(_run())
 
 
 def test_raw_message_patch_preserves_report_freshness_for_non_report_frames() -> None:
